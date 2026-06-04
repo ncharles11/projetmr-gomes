@@ -6,7 +6,7 @@ import logging
 APP_NAME = "FacialRecognitionApp"
 
 # --- Logging ---
-LOG_LEVEL = logging.INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+LOG_LEVEL = logging.WARNING  # DEBUG, INFO, WARNING, ERROR, CRITICAL
 LOG_FORMAT = '%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s'
 LOG_TO_FILE = False # Set to True to log to a file
 LOG_FILENAME = "app.log"
@@ -34,7 +34,7 @@ RECOGNITION_THRESHOLD = 0.50 # Cosine similarity threshold for a match
 ADAPTATION_THRESHOLD = 0.65  # Min similarity to update embedding (continuous learning)
 
 # --- Image Quality ---
-BLUR_THRESHOLD = 100.0       # Min Laplacian variance to accept image quality for adaptation/enrollment
+BLUR_THRESHOLD = 75.0       # Min Laplacian variance to accept image quality for adaptation/enrollment
 
 # --- Pose / Distance Gate ---------------------------------------------
 MAX_POSE_DEG = 30        # |yaw|, |pitch|, |roll| must be ≤ this
@@ -51,7 +51,7 @@ MIN_FACE_FRAC = 0.20  # face-height must be ≥ 20 % of frame height
 
 # --- Detection ---
 DETECTOR_INPUT_SIZE = (640, 640) # Must be tuple (width, height) or single int
-DETECTION_INTERVAL_SECONDS = 1.0 # Process frames for detection every X seconds
+DETECTION_INTERVAL_SECONDS = 0.3 # Process frames for detection every X seconds
 
 # --- Anti-Spoofing ---
 ANTI_SPOOFING_INPUT_SIZE = (80, 80) # Must be tuple (width, height) or single int
@@ -69,6 +69,10 @@ ANTI_SPOOFING_GPU_ID = 0 # GPU ID for anti-spoofing model, -1 for CPU
 # --- GUI ---
 GUI_UPDATE_INTERVAL_MS = 33 # Target ~30 FPS (milliseconds)
 GUI_WINDOW_TITLE = "Facial Recognition"
+
+# --- Serial Communication ---
+SERIAL_PORT = '/dev/cu.usbserial-0001'  # À ajuster selon l'OS (ex: 'COM3' ou '/dev/ttyACM0')
+SERIAL_BAUDRATE = 115200
 
 # --- Enrollment ---
 ENROLL_CONFIRM_KEY = ord('s')

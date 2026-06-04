@@ -85,6 +85,40 @@ class FaceRecognitionGUI:
         )
         self.status_label.grid(row=0, column=0, sticky="nsew", pady=20)
 
+        # Callback attributes — à lier depuis main.py avant le démarrage de la boucle
+        self.on_enroll = None        # callable()
+        self.on_motor_manual = None  # callable(direction: str)
+
+        # --- Bouton enrôlement ---
+        self.enroll_button = ttk.Button(
+            self.status_frame,
+            text="Ajouter un conducteur",
+            command=self._on_enroll_click,
+        )
+        self.enroll_button.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 8))
+
+        # --- Pavé directionnel ---
+        dpad_frame = ttk.LabelFrame(self.status_frame, text="Réglage moteur", padding="6")
+        dpad_frame.grid(row=2, column=0, pady=(0, 10))
+        dpad_frame.columnconfigure((0, 1, 2), weight=1)
+
+        _w = {"width": 3}
+        ttk.Button(dpad_frame, text="▲", command=lambda: self._on_motor_manual_click("up"),    **_w).grid(row=0, column=1, padx=2, pady=2)
+        ttk.Button(dpad_frame, text="◄", command=lambda: self._on_motor_manual_click("left"),  **_w).grid(row=1, column=0, padx=2, pady=2)
+        ttk.Button(dpad_frame, text="►", command=lambda: self._on_motor_manual_click("right"), **_w).grid(row=1, column=2, padx=2, pady=2)
+        ttk.Button(dpad_frame, text="▼", command=lambda: self._on_motor_manual_click("down"),  **_w).grid(row=2, column=1, padx=2, pady=2)
+
+        # Callback calibration — à lier depuis main.py
+        self.on_calibrate_zero = None  # callable()
+
+        # --- Bouton calibration zéro ---
+        self.calibrate_button = ttk.Button(
+            self.status_frame,
+            text="🎯 Fixer le point Zéro",
+            command=self._on_calibrate_zero_click,
+        )
+        self.calibrate_button.grid(row=3, column=0, sticky="ew", padx=5, pady=(0, 6))
+
         logger.debug("GUI initialized.")
 
     def _on_resize(self, event):
@@ -123,10 +157,10 @@ class FaceRecognitionGUI:
             widget_width = self.video_label.winfo_width()
             widget_height = self.video_label.winfo_height()
 
-            if widget_width <= 1 or widget_height <= 1: # Widget not yet rendered
-                # Use original frame size for initial display
-                widget_width = frame.shape[1]
-                widget_height = frame.shape[0]
+            if widget_width <= 10 or widget_height <= 10: # Widget not yet rendered or very small (macOS fix)
+                # Use default fallback size for initial display on Mac
+                widget_width = 640
+                widget_height = 480
 
             # Calculate aspect ratios
             img_height, img_width = frame.shape[:2]
@@ -175,3 +209,18 @@ class FaceRecognitionGUI:
             # Clear image on error
             self.video_label.config(image=None)
             self.video_label.image = None
+
+    def _on_enroll_click(self):
+        """Déclenché par le bouton 'Ajouter un conducteur'. Lier self.on_enroll dans main.py."""
+        if self.on_enroll:
+            self.on_enroll()
+
+    def _on_motor_manual_click(self, direction: str):
+        """Déclenché par le pavé directionnel. direction ∈ {'up','down','left','right'}. Lier self.on_motor_manual dans main.py."""
+        if self.on_motor_manual:
+            self.on_motor_manual(direction)
+
+    def _on_calibrate_zero_click(self):
+        """Déclenché par le bouton 'Fixer le point Zéro'. Lier self.on_calibrate_zero dans main.py."""
+        if self.on_calibrate_zero:
+            self.on_calibrate_zero()

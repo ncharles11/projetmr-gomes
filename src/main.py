@@ -1,9 +1,14 @@
-# src/main.py
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
 import tkinter as tk
+from tkinter import simpledialog
 import cv2
 import time
 import numpy as np
 import logging
+import json
+import os
 from typing import Optional, Tuple, Dict, Any
 
 # --- Setup Logging First ---
@@ -23,6 +28,7 @@ from src.database import EmbeddingDatabase
 from src.gui import FaceRecognitionGUI
 from src import config # Import configuration
 from src.utils import check_image_quality, draw_detection, estimate_pose
+from src.hardware_comm import ESP32Communicator
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +44,15 @@ class RecognitionApp:
         self.db: Optional[EmbeddingDatabase] = None
         self.cap: Optional[cv2.VideoCapture] = None
 
+        # --- User Profiles & Anti-Spam ---
+        self.dernier_utilisateur_actif = None
+        self.utilisateurs_coords = {}
+        self._load_utilisateurs_json()
+        self.esp32_comm = ESP32Communicator()
+
         # Application state
+        self.is_enrolling = False
+        self.is_authenticated = False
         self.state: Dict[str, Any] = {
             "last_detection_time": 0.0,
             "last_save_time": time.time(),
@@ -61,10 +75,104 @@ class RecognitionApp:
 
         # Setup GUI and Video Capture
         self.gui = FaceRecognitionGUI(root)
+        self.gui.on_motor_manual = self._on_motor_manual
+        self.gui.on_calibrate_zero = self._on_calibrate_zero
         self._setup_video_capture()
 
         # Set close protocol
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _load_utilisateurs_json(self):
+        """Loads user coordinates from data/utilisateurs.json."""
+        json_path = os.path.join("data", "utilisateurs.json")
+        try:
+            if os.path.exists(json_path):
+                with open(json_path, 'r') as f:
+                    self.utilisateurs_coords = json.load(f)
+                logger.info(f"Loaded coordinates for {len(self.utilisateurs_coords)} users.")
+            else:
+                logger.warning(f"File {json_path} not found. Using empty profiles.")
+        except Exception as e:
+            logger.error(f"Error loading {json_path}: {e}")
+
+    def _save_utilisateurs_json(self):
+        """Saves user coordinates to data/utilisateurs.json."""
+        json_path = os.path.join("data", "utilisateurs.json")
+        try:
+            # S'assurer que le dossier data existe
+            os.makedirs(os.path.dirname(json_path), exist_ok=True)
+            with open(json_path, 'w') as f:
+                json.dump(self.utilisateurs_coords, f, indent=4)
+            logger.info(f"Saved {len(self.utilisateurs_coords)} user profiles to {json_path}.")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving {json_path}: {e}")
+            return False
+
+    def _enroll_new_user(self, temps_droite, temps_bas):
+        """Procédure d'enrôlement pour un nouvel utilisateur."""
+        self.is_enrolling = True
+        self.gui.update_status("ENRÔLEMENT EN COURS...")
+        
+        # 1. Demander le nom
+        person_id = simpledialog.askstring("Nouveau Conducteur", "Entrez le nom du nouveau conducteur :", parent=self.root)
+        
+        if not person_id:
+            logger.info("Enrôlement annulé (pas de nom fourni).")
+            self.is_enrolling = False
+            return
+
+        person_id = person_id.strip()
+        
+        # 2. Capturer une image de qualité
+        logger.info(f"Démarrage de la capture pour {person_id}...")
+        start_enroll_time = time.time()
+        timeout = 10 # 10 secondes pour trouver un visage
+        
+        captured_embedding = None
+        
+        while time.time() - start_enroll_time < timeout:
+            ret, frame = self.cap.read()
+            if not ret: continue
+            
+            bboxes, landmarks = self.detector.detect_faces(frame)
+            if bboxes is not None and len(bboxes) > 0:
+                # Prendre le premier visage pour simplifier
+                landmark = landmarks[0]
+                embedding_result = self.embedder.get_embedding(frame, landmark, return_aligned=True)
+                
+                if embedding_result and embedding_result[0] is not None:
+                    embedding, aligned_face = embedding_result
+                    if check_image_quality(aligned_face):
+                        captured_embedding = embedding
+                        logger.info(f"Visage capturé avec succès pour {person_id}.")
+                        break
+            
+            # Afficher le flux pendant la capture
+            self.gui.update_image(frame)
+            self.root.update()
+            time.sleep(0.01)
+
+        if captured_embedding is not None:
+            # 3. Sauvegarder l'embedding
+            self.db.add_embedding(person_id, captured_embedding)
+            self.db.save_to_file()
+            
+            # 4. Sauvegarder les réglages moteurs
+            self.utilisateurs_coords[person_id] = {
+                "tempsDroite": temps_droite,
+                "tempsBas": temps_bas
+            }
+            self._save_utilisateurs_json()
+            
+            self.dernier_utilisateur_actif = person_id
+            self.gui.update_status(f"Bienvenue {person_id} !")
+            logger.info(f"Profil complet créé pour {person_id}.")
+        else:
+            self.gui.update_status("Erreur : Aucun visage détecté.")
+            logger.error("Échec de l'enrôlement : timeout ou mauvaise qualité.")
+
+        self.is_enrolling = False
 
     def _initialize_components(self) -> bool:
         """Initializes face detection, anti-spoofing, embedding, and recognition components."""
@@ -243,13 +351,14 @@ class RecognitionApp:
 
         return results
 
-    def _process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, str]:
+    def _process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, str, Optional[str]]:
         """Detects faces and processes each one using a helper method."""
         start_time = time.time()
         processed_frame = frame.copy()
         overall_status = "No face detected" # Default status for the frame
         active_processing = False
         highest_priority_status = 10 # Lower number = higher priority
+        active_person_id = None
 
         STATUS_PRIORITY = { # Define priority for overall status message
             "Spoof Detected": 0,                           # Highest priority - security threat
@@ -275,7 +384,7 @@ class RecognitionApp:
         # Ensure essential components are ready
         if not self.detector or not self.embedder or not self.recognizer or not self.db:
              logger.error("Core components not initialized in _process_frame.")
-             return processed_frame, "Error: Components not ready"
+             return processed_frame, "Error: Components not ready", None
 
         database_content = self.db.get_database()
 
@@ -303,6 +412,7 @@ class RecognitionApp:
                     if current_priority < highest_priority_status:
                         highest_priority_status = current_priority
                         overall_status = face_results["status"] # Set overall status to highest priority found
+                        active_person_id = face_results["person_id"]
 
                     # --- 3. Adaptation Logic (Based on helper results) ---
                     if (face_results["person_id"] is not None and
@@ -329,72 +439,168 @@ class RecognitionApp:
             processing_time = (time.time() - start_time) * 1000 # ms
             logger.debug(f"Frame processing time: {processing_time:.2f} ms")
 
-        # Return the annotated frame and the determined overall status
-        return processed_frame, overall_status
+        # Return the annotated frame, the determined overall status, and identified person_id
+        return processed_frame, overall_status, active_person_id
 
+    def _handle_esp32_messages(self):
+        """Vérifie et gère les messages reçus de l'ESP32 de manière non-bloquante."""
+        if not hasattr(self, 'esp32_comm') or self.esp32_comm is None:
+            return
+
+        try:
+            msg = self.esp32_comm.read_message()
+            if not msg:
+                return
+
+            action = msg.get("action")
+            if action == "save_profile":
+                temps_droite = msg.get("tempsDroite", 0)
+                temps_bas = msg.get("tempsBas", 0)
+                
+                if self.dernier_utilisateur_actif is None:
+                    logger.info("Commande de sauvegarde reçue pour un utilisateur inconnu.")
+                    self._enroll_new_user(temps_droite, temps_bas)
+                else:
+                    user = self.dernier_utilisateur_actif
+                    logger.info(f"Mise à jour des réglages pour {user}: R={temps_droite}, D={temps_bas}")
+                    self.utilisateurs_coords[user] = {
+                        "tempsDroite": temps_droite,
+                        "tempsBas": temps_bas
+                    }
+                    self._save_utilisateurs_json()
+                    self.gui.update_status(f"Réglages mis à jour pour {user}")
+        except Exception as e:
+            logger.error(f"Erreur lors de la lecture des messages ESP32: {e}")
+
+    def _on_motor_manual(self, direction: str):
+        """Envoie le caractère de commande moteur correspondant à la direction du pavé."""
+        char_map = {"up": "H", "down": "B", "left": "G", "right": "D"}
+        char = char_map.get(direction)
+        if char is None:
+            logger.warning(f"Direction inconnue reçue du pavé : {direction!r}")
+            return
+        logger.info(f"Commande manuelle moteur : {direction} → '{char}'")
+        self.esp32_comm.send_raw(char)
+
+    def _on_calibrate_zero(self):
+        """Envoie le caractère 'Z' à l'ESP32 pour fixer la position zéro des moteurs."""
+        logger.info("Calibration : envoi du point zéro 'Z' à l'ESP32.")
+        self.esp32_comm.send_raw("Z")
 
     def _update_gui_loop(self):
-        """The main loop that reads frames and updates the GUI."""
-        if not self.state["running"]:
-            logger.info("Update loop stopped.")
-            return
+        """The main loop that reads frames and updates the GUI with intensive logging."""
+        try:
+            logger.info("--- DEBUG LOOP START ---")
+            
+            if not self.state["running"]:
+                logger.info("Update loop stopped.")
+                return
 
-        if not self.cap or not self.cap.isOpened():
-            logger.error("Camera not available in update loop.")
-            self.gui.update_status("Error: Camera disconnected!")
-            # Schedule next attempt slightly further out
-            self.root.after(1000, self._update_gui_loop)
-            return
+            # Gérer les messages ESP32 (ex: demande de sauvegarde)
+            self._handle_esp32_messages()
+            logger.info("ESP32 messages handled.")
 
-        start_read_time = time.time()
-        ret, frame = self.cap.read()
-        read_time = (time.time() - start_read_time) * 1000
-        logger.debug(f"Frame read time: {read_time:.2f} ms")
+            if self.is_enrolling:
+                logger.info("Skipping recognition (enrolling)...")
+                self.root.after(config.GUI_UPDATE_INTERVAL_MS, self._update_gui_loop)
+                return
 
-        if not ret or frame is None:
-            logger.warning("Failed to read frame from camera.")
-            # Keep trying, maybe the camera will come back
-            self.root.after(config.GUI_UPDATE_INTERVAL_MS, self._update_gui_loop)
-            return
+            is_open = self.cap.isOpened() if self.cap else False
+            logger.info(f"Camera open state: {is_open}")
 
-        current_time = time.time()
-        frame_to_display = frame.copy() # Default to raw frame
+            if not self.cap or not is_open:
+                logger.error("Camera not available in update loop.")
+                self.gui.update_status("Error: Camera disconnected!")
+                self.root.after(1000, self._update_gui_loop)
+                return
 
-        # --- Periodic Detection/Recognition ---
-        if current_time - self.state["last_detection_time"] >= config.DETECTION_INTERVAL_SECONDS:
-            processed_frame, status = self._process_frame(frame)
-            self.state["current_status"] = status
-            self.state["last_detection_time"] = current_time
-            self.state["last_processed_frame"] = processed_frame # Store frame with drawings
-            frame_to_display = processed_frame # Display the processed frame
-            self.gui.update_status(self.state["current_status"])
-            logger.debug(f"Detection cycle finished. Status: {status}")
-        else:
-            # --- Display previous results between detection cycles ---
-            if self.state["last_processed_frame"] is not None:
-                # Showing last processed frame
-                frame_to_display = self.state["last_processed_frame"]
-                # Keep updating status label even between detections
-                self.gui.update_status(self.state["current_status"])
+            start_read_time = time.time()
+            ret, frame = self.cap.read()
+            read_time = (time.time() - start_read_time) * 1000
+            
+            logger.info(f"Camera read: ret={ret}, frame_is_none={frame is None}")
+
+            if not ret or frame is None:
+                logger.warning("Failed to read frame from camera. Retrying...")
+                self.root.after(33, self._update_gui_loop)
+                return
+            
+            logger.info(f"Frame shape: {frame.shape}")
+
+            current_time = time.time()
+            frame_to_display = frame.copy() # Default to raw frame
+
+            # --- Periodic Detection/Recognition (désactivée après authentification) ---
+            if not self.is_authenticated:
+                if current_time - self.state["last_detection_time"] >= config.DETECTION_INTERVAL_SECONDS:
+                    logger.info("Starting detection cycle...")
+                    processed_frame, status, person_id = self._process_frame(frame)
+                    self.state["current_status"] = status
+                    self.state["last_detection_time"] = current_time
+                    self.state["last_processed_frame"] = processed_frame
+                    frame_to_display = processed_frame
+                    logger.info(f"Detection cycle finished. Status: {status}")
+
+                    if person_id is not None:
+                        # --- Authentification réussie — une seule fois ---
+                        self.is_authenticated = True
+                        self.dernier_utilisateur_actif = person_id
+
+                        # Recharger le JSON pour avoir les réglages les plus récents
+                        self._load_utilisateurs_json()
+                        if person_id in self.utilisateurs_coords:
+                            user_data = self.utilisateurs_coords[person_id]
+                            temps_droite = user_data.get("tempsDroite", 0)
+                            temps_bas = user_data.get("tempsBas", 0)
+                            logger.info(
+                                f"Réglages chargés pour '{person_id}' : "
+                                f"tempsDroite={temps_droite}, tempsBas={temps_bas}"
+                            )
+                        else:
+                            temps_droite = 0
+                            temps_bas = 0
+                            logger.warning(
+                                f"'{person_id}' absent de utilisateurs.json. "
+                                f"Envoi des valeurs par défaut (tempsDroite=0, tempsBas=0)."
+                            )
+
+                        welcome_msg = f"Bonjour {person_id} !"
+                        self.state["current_status"] = welcome_msg
+                        self.gui.update_status(welcome_msg)
+                        logger.info(f"Authentification réussie : {person_id}. Envoi réglages ESP32.")
+                        self.esp32_comm.send_auth_data(person_id, temps_droite, temps_bas)
+                    else:
+                        self.gui.update_status(self.state["current_status"])
+                else:
+                    # Entre deux cycles — affiche la dernière frame annotée
+                    if self.state["last_processed_frame"] is not None:
+                        frame_to_display = self.state["last_processed_frame"]
+                    self.gui.update_status(self.state["current_status"])
             else:
-                # Before first detection or if detection failed
+                # Authentifié — pas de détection, flux vidéo brut, statut figé
+                frame_to_display = frame
                 self.gui.update_status(self.state["current_status"])
 
+            # --- Update GUI Image ---
+            if self.gui:
+                logger.info("Calling gui.update_image...")
+                self.gui.update_image(frame_to_display)
+                logger.info("gui.update_image finished.")
 
-        # --- Update GUI Image ---
-        if self.gui:
-            self.gui.update_image(frame_to_display)
+            # --- Periodic Database Save ---
+            if self.db and current_time - self.state["last_save_time"] > 300:
+                logger.debug("Periodic save check...")
+                self.db.save_if_dirty()
+                self.state["last_save_time"] = current_time
 
-        # --- Periodic Database Save ---
-        # Save every 5 minutes if dirty
-        if self.db and current_time - self.state["last_save_time"] > 300:
-            logger.debug("Periodic save check...")
-            self.db.save_if_dirty() # Saves only if needed
-            self.state["last_save_time"] = current_time # Update time even if not saved
+            # --- Schedule next update ---
+            self.root.after(config.GUI_UPDATE_INTERVAL_MS, self._update_gui_loop)
+            logger.info("--- DEBUG LOOP END (Scheduled) ---")
 
-        # --- Schedule next update ---
-        self.root.after(config.GUI_UPDATE_INTERVAL_MS, self._update_gui_loop)
-
+        except Exception as e:
+            logger.error(f"FATAL ERROR in _update_gui_loop: {e}", exc_info=True)
+            # Re-planifier quand même pour éviter que l'app ne s'arrête
+            self.root.after(1000, self._update_gui_loop)
 
     def run(self):
         """Starts the GUI main loop and the update process."""
@@ -408,8 +614,13 @@ class RecognitionApp:
         logger.info("Starting GUI main loop...")
         self.state["current_status"] = "Waiting for detection..."
         self.gui.update_status(self.state["current_status"])
+        
+        # Forcer le rendu initial sur macOS
+        self.root.update_idletasks()
+        self.root.update()
+
         # Start the update loop
-        self.root.after(50, self._update_gui_loop) # Start after small delay
+        self.root.after(1500, self._update_gui_loop) # Délai macOS : laisse les drivers caméra s'initialiser
         # Start Tkinter main loop
         self.root.mainloop()
 
