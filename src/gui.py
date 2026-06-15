@@ -2,225 +2,904 @@
 import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
+from datetime import datetime
 import cv2
 import numpy as np
 import logging
+import os
 from typing import Optional
 from src import config
 
+try:
+    from tkintermapview import TkinterMapView
+    import geocoder as _geocoder
+    _MAP_AVAILABLE = True
+except ImportError:
+    _MAP_AVAILABLE = False
+    _geocoder = None
+
+import customtkinter as ctk
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
 logger = logging.getLogger(__name__)
 
-class FaceRecognitionGUI:
-    """
-    Handles the graphical user interface for the facial recognition application
-    using Tkinter and ttk for a more modern look.
-    """
-    def __init__(self, root: tk.Tk):
-        """
-        Initializes the GUI components within the main Tkinter window.
+# ── Palette EV-OS ─────────────────────────────────────────────────────────────
+BG       = '#0A1118'
+SIDEBAR  = '#0D141C'
+CARD     = '#16222F'
+CARD_CTK = '#1B2B3B'   # cartes CTkFrame (légèrement plus clair pour profondeur)
+ENTRY_BG = '#0F1C28'   # champs de saisie / listbox
+TEXT     = '#FFFFFF'
+SUB      = '#94A3B8'   # gris bleuté discret
+CYAN     = '#00E5FF'
+NAV_ACT  = '#1A3A4A'
+BLACK    = '#000000'
 
-        Args:
-            root: The main Tkinter root window.
-        """
+
+class FaceRecognitionGUI:
+    def __init__(self, root: ctk.CTk):
         self.root = root
         self.root.title(config.GUI_WINDOW_TITLE)
-        # Set minimum window size
-        self.root.minsize(800, 500)
-        self.root.configure(bg='#e0e0e0') # Slightly darker background
+        self.root.minsize(1100, 650)
 
-        # --- Configure ttk styles ---
-        self.style = ttk.Style(self.root)
-        available_themes = self.style.theme_names()
-        logger.debug(f"Available ttk themes: {available_themes}")
-        # Try themes in preferred order
-        for theme in ['clam', 'alt', 'default']:
-            try:
-                self.style.theme_use(theme)
-                logger.info(f"Using ttk theme: {theme}")
-                break
-            except tk.TclError:
-                continue
-        else:
-            logger.warning("Could not set preferred ttk theme, using system default.")
+        # Callbacks — liés depuis main.py
+        self.on_enroll_user    = None
+        self.on_motor_manual   = None
+        self.on_calibrate_zero = None
+        self.on_prev           = None
+        self.on_toggle         = None
+        self.on_next           = None
+        self.on_scan_wifi      = None
+        self.on_connect_wifi   = None
+        self.on_reset_user     = None
+        self.on_save_enroll    = None
+        self.on_cancel_enroll  = None
 
-        # General style configurations
-        self.style.configure('TFrame', background='#e0e0e0')
-        self.style.configure('TLabel', background='#e0e0e0', font=('Helvetica', 10))
-        # Custom style for the main video display label
-        self.style.configure('Video.TLabel', background='black') # Black background for video area
-        # Custom style for the status label
-        self.style.configure('Status.TLabel', background='#e8e8e8', font=('Helvetica', 14, 'bold'), padding=10)
+        self._active_page    = None
+        self._pages          = {}
+        self._last_img_size  = (0, 0)
+        self.marker_frames: list = []
+        self._current_marker     = None
 
-        # --- Main frame ---
-        self.main_frame = ttk.Frame(self.root, padding="10 10 10 10")
-        self.main_frame.pack(fill=tk.BOTH, expand=True)
-        # Configure grid layout for main_frame
-        self.main_frame.columnconfigure(0, weight=3) # Video area takes more space
-        self.main_frame.columnconfigure(1, weight=1) # Status area
-        self.main_frame.rowconfigure(0, weight=1)
-
-        # --- Video Frame (Left) ---
-        self.video_frame = ttk.Frame(self.main_frame, padding="5", relief=tk.SUNKEN, borderwidth=1)
-        self.video_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        self.video_frame.pack_propagate(False) # Prevent frame from shrinking to label size
-
-        self.video_label = ttk.Label(self.video_frame, style='Video.TLabel', anchor=tk.CENTER)
-        self.video_label.pack(fill=tk.BOTH, expand=True)
-        self.video_label.bind('<Configure>', self._on_resize) # Handle resizing
-        self._last_img_size = (0, 0) # Store last image size for resize logic
-
-        # --- Status Frame (Right) ---
-        self.status_frame = ttk.Frame(self.main_frame, padding="10")
-        self.status_frame.grid(row=0, column=1, sticky="nsew")
-        self.status_frame.rowconfigure(0, weight=1) # Make label expand vertically
-        self.status_frame.columnconfigure(0, weight=1)
-
-        self.status_label = ttk.Label(
-            self.status_frame,
-            text="Status: Initializing...",
-            style='Status.TLabel',
-            anchor=tk.CENTER,
-            justify=tk.CENTER,
-            wraplength=200 # Wrap text if status gets too long
-        )
-        self.status_label.grid(row=0, column=0, sticky="nsew", pady=20)
-
-        # Callback attributes — à lier depuis main.py avant le démarrage de la boucle
-        self.on_enroll = None        # callable()
-        self.on_motor_manual = None  # callable(direction: str)
-
-        # --- Bouton enrôlement ---
-        self.enroll_button = ttk.Button(
-            self.status_frame,
-            text="Ajouter un conducteur",
-            command=self._on_enroll_click,
-        )
-        self.enroll_button.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 8))
-
-        # --- Pavé directionnel ---
-        dpad_frame = ttk.LabelFrame(self.status_frame, text="Réglage moteur", padding="6")
-        dpad_frame.grid(row=2, column=0, pady=(0, 10))
-        dpad_frame.columnconfigure((0, 1, 2), weight=1)
-
-        _w = {"width": 3}
-        ttk.Button(dpad_frame, text="▲", command=lambda: self._on_motor_manual_click("up"),    **_w).grid(row=0, column=1, padx=2, pady=2)
-        ttk.Button(dpad_frame, text="◄", command=lambda: self._on_motor_manual_click("left"),  **_w).grid(row=1, column=0, padx=2, pady=2)
-        ttk.Button(dpad_frame, text="►", command=lambda: self._on_motor_manual_click("right"), **_w).grid(row=1, column=2, padx=2, pady=2)
-        ttk.Button(dpad_frame, text="▼", command=lambda: self._on_motor_manual_click("down"),  **_w).grid(row=2, column=1, padx=2, pady=2)
-
-        # Callback calibration — à lier depuis main.py
-        self.on_calibrate_zero = None  # callable()
-
-        # --- Bouton calibration zéro ---
-        self.calibrate_button = ttk.Button(
-            self.status_frame,
-            text="🎯 Fixer le point Zéro",
-            command=self._on_calibrate_zero_click,
-        )
-        self.calibrate_button.grid(row=3, column=0, sticky="ew", padx=5, pady=(0, 6))
-
+        self._load_sidebar_icons()
+        self._build_layout()
+        self._update_clock()
         logger.debug("GUI initialized.")
 
-    def _on_resize(self, event):
-        """Handles resizing of the video label area to maintain aspect ratio."""
-        # This basic resize just notes the event, more complex logic could go here
-        # if needed, e.g., recalculating image display size.
-        logger.debug(f"Video label resized to: {event.width}x{event.height}")
+    # ── Icônes sidebar ────────────────────────────────────────────────────────
+    def _load_sidebar_icons(self):
+        """Charge les PNG en CTkImage 28×28. Fallback silencieux si absent."""
+        self._sidebar_icons: dict = {}
+        assets_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'assets'
+        )
+        for key, filename in [
+            ('home',     'home.png'),
+            ('vehicle',  'vehicle.png'),
+            ('media',    'media.png'),
+            ('settings', 'settings.png'),
+        ]:
+            path = os.path.join(assets_dir, filename)
+            try:
+                img = Image.open(path).resize((28, 28), Image.Resampling.LANCZOS)
+                self._sidebar_icons[key] = ctk.CTkImage(
+                    light_image=img, dark_image=img, size=(28, 28)
+                )
+                logger.debug(f"CTkImage chargée : {path}")
+            except FileNotFoundError:
+                logger.info(f"Icône absente, fallback emoji : {filename}")
+            except Exception as e:
+                logger.warning(f"Erreur chargement icône {filename} : {e}")
 
-    def update_status(self, text: str):
-        """Updates the status label text."""
-        if not isinstance(text, str):
-            logger.warning(f"Invalid status text type: {type(text)}. Converting to string.")
-            text = str(text)
-        self.status_label.config(text=f"Status:\n{text}") # Add newline for better formatting
+    # ── Layout racine ─────────────────────────────────────────────────────────
+    def _build_layout(self):
+        root_f = ctk.CTkFrame(self.root, fg_color=BG, corner_radius=0)
+        root_f.pack(fill='both', expand=True)
+        root_f.columnconfigure(0, weight=0, minsize=130)
+        root_f.columnconfigure(1, weight=1)
+        root_f.rowconfigure(0, weight=1)
 
-    def update_image(self, frame: Optional[np.ndarray]):
-        """
-        Updates the video label with a new frame.
+        self._build_sidebar(root_f)
+        self._build_content_area(root_f)
+        self._show_page('home')
 
-        Args:
-            frame: The OpenCV frame (BGR format) to display, or None to clear.
-        """
-        if frame is None:
-            # Optionally display a "No Signal" image or just clear
-            self.video_label.config(image=None)
-            self.video_label.image = None # Keep reference
-            logger.debug("Cleared video display.")
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+    def _build_sidebar(self, parent):
+        sb = ctk.CTkFrame(parent, fg_color=SIDEBAR, width=130, corner_radius=0)
+        sb.grid(row=0, column=0, sticky='nsew')
+        sb.pack_propagate(False)
+
+        ctk.CTkLabel(sb, text="EV-OS", text_color=CYAN,
+                     font=ctk.CTkFont(family='Helvetica', size=18, weight='bold')
+                     ).pack(pady=(20, 2))
+        ctk.CTkLabel(sb, text="Mirror AI", text_color=SUB,
+                     font=ctk.CTkFont(family='Helvetica', size=9)
+                     ).pack(pady=(0, 20))
+
+        ctk.CTkFrame(sb, fg_color=CARD, height=1, corner_radius=0
+                     ).pack(fill='x', padx=12, pady=(0, 16))
+
+        self._nav_buttons = {}
+        for key, emoji, label in [
+            ('home',     '🏠', 'Home'),
+            ('vehicle',  '🚗', 'Vehicle'),
+            ('media',    '🎵', 'Media'),
+            ('settings', '⚙️', 'Settings'),
+        ]:
+            icon_img = self._sidebar_icons.get(key)
+            btn = ctk.CTkButton(
+                sb,
+                text=label,
+                image=icon_img if icon_img else None,
+                compound='top' if icon_img else 'left',
+                width=110,
+                height=70 if icon_img else 44,
+                corner_radius=8,
+                fg_color='transparent',
+                text_color=SUB,
+                hover_color=NAV_ACT,
+                font=ctk.CTkFont(
+                    family='Helvetica',
+                    size=9 if icon_img else 11
+                ),
+                anchor='center',
+                command=lambda k=key: self._show_page(k),
+            )
+            btn.pack(fill='x', padx=10, pady=2)
+            self._nav_buttons[key] = btn
+
+    def _show_page(self, name: str):
+        if self._active_page == name:
             return
+        if self._active_page:
+            self._nav_buttons[self._active_page].configure(
+                fg_color='transparent', text_color=SUB,
+            )
+        self._active_page = name
+        self._nav_buttons[name].configure(
+            fg_color=NAV_ACT, text_color=CYAN,
+        )
+        self._pages[name].tkraise()
 
-        if not isinstance(frame, np.ndarray) or frame.ndim != 3:
-            logger.warning("Invalid frame passed to update_image.")
-            return
+    # ── Zone contenu ──────────────────────────────────────────────────────────
+    def _build_content_area(self, parent):
+        area = ctk.CTkFrame(parent, fg_color=BG, corner_radius=0)
+        area.grid(row=0, column=1, sticky='nsew')
+        area.columnconfigure(0, weight=1)
+        area.rowconfigure(0, weight=1)
 
-        try:
-            # Get the dimensions of the label widget
-            widget_width = self.video_label.winfo_width()
-            widget_height = self.video_label.winfo_height()
+        self._pages['home']     = self._make_home_page(area)
+        self._pages['vehicle']  = self._make_vehicle_page(area)
+        self._pages['media']    = self._make_media_page(area)
+        self._pages['settings'] = self._make_settings_page(area)
+        for p in self._pages.values():
+            p.grid(row=0, column=0, sticky='nsew')
 
-            if widget_width <= 10 or widget_height <= 10: # Widget not yet rendered or very small (macOS fix)
-                # Use default fallback size for initial display on Mac
-                widget_width = 640
-                widget_height = 480
+    # ── PAGE HOME ─────────────────────────────────────────────────────────────
+    def _make_home_page(self, parent) -> ctk.CTkFrame:
+        page = ctk.CTkFrame(parent, fg_color=BG, corner_radius=0)
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(2, weight=1)
 
-            # Calculate aspect ratios
-            img_height, img_width = frame.shape[:2]
-            widget_aspect = widget_width / widget_height
-            img_aspect = img_width / img_height
+        # Row 0 — Topbar
+        topbar = ctk.CTkFrame(page, fg_color=BG, corner_radius=0)
+        topbar.grid(row=0, column=0, sticky='ew', padx=20, pady=(14, 2))
+        topbar.columnconfigure(1, weight=1)
 
-            # Resize image to fit widget while maintaining aspect ratio
-            if img_aspect > widget_aspect:
-                # Image is wider than widget aspect ratio -> fit to width
-                new_width = widget_width
-                new_height = int(new_width / img_aspect)
-            else:
-                # Image is taller or same aspect ratio -> fit to height
-                new_height = widget_height
-                new_width = int(new_height * img_aspect)
+        left_info = ctk.CTkFrame(topbar, fg_color=BG, corner_radius=0)
+        left_info.grid(row=0, column=0, sticky='w')
+        self._clock_label = ctk.CTkLabel(
+            left_info, text='',
+            text_color=TEXT,
+            font=ctk.CTkFont(family='Helvetica', size=22, weight='bold'),
+        )
+        self._clock_label.pack(anchor='w')
+        self._date_label = ctk.CTkLabel(
+            left_info, text='',
+            text_color=SUB,
+            font=ctk.CTkFont(family='Helvetica', size=10),
+        )
+        self._date_label.pack(anchor='w')
 
-            # Prevent resizing to zero dimensions
-            if new_width < 1 or new_height < 1:
-                logger.debug("Skipping image update due to zero target dimensions.")
-                return
+        right_info = ctk.CTkFrame(topbar, fg_color=BG, corner_radius=0)
+        right_info.grid(row=0, column=2, sticky='e')
 
-            # Resize only if the size has changed significantly
-            if abs(new_width - self._last_img_size[0]) > 2 or abs(new_height - self._last_img_size[1]) > 2:
-                resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
-                self._last_img_size = (new_width, new_height)
-                logger.debug(f"Resized frame to {new_width}x{new_height}")
-            else:
-                # Use previously resized dimensions if available and close enough
-                resized_frame = cv2.resize(frame, self._last_img_size, interpolation=cv2.INTER_AREA)
+        # GIF animé position — tk.Label conservé pour le GC guard
+        self._position_marker_label = tk.Label(right_info, bg=BG, bd=0)
+        self._position_marker_label.pack(anchor='e', pady=(0, 2))
 
+        self._weather_label = ctk.CTkLabel(
+            right_info, text='📍 Belfort  19°C  ⛅',
+            text_color=CYAN,
+            font=ctk.CTkFont(family='Helvetica', size=11),
+        )
+        self._weather_label.pack(anchor='e')
+        self._network_label = ctk.CTkLabel(
+            right_info, text='📶 Connecté',
+            text_color=CYAN,
+            font=ctk.CTkFont(family='Helvetica', size=9),
+        )
+        self._network_label.pack(anchor='e')
 
-            # Convert BGR (OpenCV) to RGB (PIL)
-            frame_rgb = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
-            img_pil = Image.fromarray(frame_rgb)
+        # Row 1 — Status strip
+        self._status_label = ctk.CTkLabel(
+            page, text='Initializing...', text_color=SUB, anchor='w',
+            font=ctk.CTkFont(family='Helvetica', size=10),
+        )
+        self._status_label.grid(row=1, column=0, sticky='ew', padx=20, pady=(0, 4))
 
-            # Convert PIL Image to PhotoImage for Tkinter
-            imgtk = ImageTk.PhotoImage(image=img_pil)
+        # Row 2 — Carte GPS + overlays (map_container reste tk.Frame pour TkinterMapView)
+        map_container = tk.Frame(page, bg=BLACK, bd=0)
+        map_container.grid(row=2, column=0, sticky='nsew', padx=20, pady=(0, 6))
+        self._map_container = map_container
 
-            # Update the label widget
-            self.video_label.config(image=imgtk)
-            # IMPORTANT: Keep a reference to the image object to prevent garbage collection!
-            self.video_label.image = imgtk
+        if _MAP_AVAILABLE:
+            self._map_widget = TkinterMapView(map_container, corner_radius=0)
+            self._map_widget.place(relx=0, rely=0, relwidth=1, relheight=1)
+            self._map_widget.set_tile_server(
+                'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png')
+            self._map_widget.set_position(47.642, 6.863)
+            self._map_widget.set_zoom(12)
+        else:
+            tk.Label(map_container,
+                     text='🗺  Carte GPS\n(pip install tkintermapview)',
+                     bg='#0F1C28', fg=SUB, font=('Helvetica', 14),
+                     ).place(relx=0.5, rely=0.5, anchor='center')
+            self._map_widget = None
 
-        except Exception as e:
-            logger.error(f"Error updating GUI image: {e}", exc_info=True)
-            # Clear image on error
-            self.video_label.config(image=None)
-            self.video_label.image = None
+        # Overlay vidéo — tk.Frame + tk.Label pour l'affichage des frames caméra
+        self._video_overlay = tk.Frame(map_container, bg=BLACK, bd=0)
+        self._video_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.video_label = tk.Label(self._video_overlay, bg=BLACK)
+        self.video_label.pack(fill='both', expand=True)
 
-    def _on_enroll_click(self):
-        """Déclenché par le bouton 'Ajouter un conducteur'. Lier self.on_enroll dans main.py."""
-        if self.on_enroll:
-            self.on_enroll()
+        # Barre de recherche CTk
+        self._search_bar_frame = ctk.CTkFrame(
+            map_container, fg_color=ENTRY_BG, corner_radius=20,
+        )
+        self._search_bar_frame.place(relx=0.5, y=12, anchor='n')
 
-    def _on_motor_manual_click(self, direction: str):
-        """Déclenché par le pavé directionnel. direction ∈ {'up','down','left','right'}. Lier self.on_motor_manual dans main.py."""
+        self._search_entry = ctk.CTkEntry(
+            self._search_bar_frame,
+            width=280, height=36, corner_radius=20,
+            fg_color='transparent', border_width=0,
+            text_color=TEXT,
+            placeholder_text='Rechercher une destination...',
+            placeholder_text_color=SUB,
+            font=ctk.CTkFont(family='Helvetica', size=11),
+        )
+        self._search_entry.pack(side='left', padx=(14, 0))
+        self._search_entry.bind('<Return>', lambda e: self._on_map_search())
+
+        ctk.CTkButton(
+            self._search_bar_frame, text='⌕',
+            width=36, height=36, corner_radius=18,
+            fg_color='transparent', text_color=CYAN,
+            hover_color=NAV_ACT,
+            font=ctk.CTkFont(size=14),
+            command=self._on_map_search,
+        ).pack(side='left', padx=(2, 4))
+
+        # Bouton "Changer de conducteur" — affiché après auth
+        self._change_driver_btn = ctk.CTkButton(
+            map_container, text='🔄  Changer de conducteur',
+            width=220, height=38, corner_radius=19,
+            fg_color=ENTRY_BG, text_color=SUB,
+            hover_color=NAV_ACT,
+            border_width=1, border_color='#2A3A4A',
+            font=ctk.CTkFont(family='Helvetica', size=10),
+            command=lambda: self.on_reset_user and self.on_reset_user(),
+        )
+
+        # Row 3 — Barre Spotify
+        self._build_spotify_bar(page, row=3)
+
+        return page
+
+    def _build_spotify_bar(self, parent, row: int):
+        bar = ctk.CTkFrame(parent, fg_color=CARD_CTK, corner_radius=12)
+        bar.grid(row=row, column=0, sticky='ew', padx=20, pady=(0, 12))
+        bar.columnconfigure(1, weight=1)
+
+        # Contrôles transport
+        ctrl = ctk.CTkFrame(bar, fg_color='transparent', corner_radius=0)
+        ctrl.grid(row=0, column=0, padx=16, pady=14)
+
+        _skip = dict(
+            width=36, height=36, corner_radius=18,
+            fg_color='transparent', hover_color=NAV_ACT,
+            font=ctk.CTkFont(size=14),
+        )
+        ctk.CTkButton(ctrl, text='⏮', text_color=SUB,
+                      command=lambda: self.on_prev and self.on_prev(),
+                      **_skip).pack(side='left', padx=4)
+        self._bar_toggle = ctk.CTkButton(
+            ctrl, text='⏯', text_color=CYAN,
+            width=40, height=40, corner_radius=20,
+            fg_color=NAV_ACT, hover_color='#1E4A5A',
+            font=ctk.CTkFont(size=16, weight='bold'),
+            command=lambda: self.on_toggle and self.on_toggle(),
+        )
+        self._bar_toggle.pack(side='left', padx=6)
+        ctk.CTkButton(ctrl, text='⏭', text_color=SUB,
+                      command=lambda: self.on_next and self.on_next(),
+                      **_skip).pack(side='left', padx=4)
+
+        # Infos piste
+        info = ctk.CTkFrame(bar, fg_color='transparent', corner_radius=0)
+        info.grid(row=0, column=1, sticky='w', padx=8)
+        self._bar_title = ctk.CTkLabel(
+            info, text='En attente...', text_color=TEXT, anchor='w',
+            font=ctk.CTkFont(family='Helvetica', size=11, weight='bold'),
+        )
+        self._bar_title.pack(anchor='w')
+        self._bar_artist = ctk.CTkLabel(
+            info, text='—', text_color=SUB, anchor='w',
+            font=ctk.CTkFont(family='Helvetica', size=9),
+        )
+        self._bar_artist.pack(anchor='w')
+
+        # Progression (décorative)
+        prog_wrap = ctk.CTkFrame(bar, fg_color='transparent', corner_radius=0)
+        prog_wrap.grid(row=0, column=2, padx=20, sticky='e')
+        self._progress = ctk.CTkProgressBar(
+            prog_wrap, width=90, height=4, corner_radius=2,
+            fg_color='#1A2A3A', progress_color=CYAN,
+        )
+        self._progress.set(0.35)
+        self._progress.pack(pady=16)
+
+    # ── PAGE VEHICLE ──────────────────────────────────────────────────────────
+    def _make_vehicle_page(self, parent) -> ctk.CTkFrame:
+        page = ctk.CTkFrame(parent, fg_color=BG, corner_radius=0)
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            page, text='Mirror Controls', text_color=TEXT,
+            font=ctk.CTkFont(family='Helvetica', size=20, weight='bold'),
+        ).grid(row=0, column=0, sticky='w', padx=24, pady=(20, 14))
+
+        content = ctk.CTkFrame(page, fg_color=BG, corner_radius=0)
+        content.grid(row=1, column=0, sticky='nsew', padx=24, pady=(0, 12))
+        content.columnconfigure(0, weight=1)
+        content.columnconfigure(1, weight=2)
+        content.rowconfigure(0, weight=1)
+
+        # Carte sélecteur de rétroviseur
+        sel = ctk.CTkFrame(content, corner_radius=15, fg_color=CARD_CTK)
+        sel.grid(row=0, column=0, sticky='nsew', padx=(0, 14))
+
+        ctk.CTkLabel(sel, text='Select Mirror', text_color=SUB,
+                     font=ctk.CTkFont(family='Helvetica', size=10)
+                     ).pack(pady=(20, 14))
+
+        self._mirror_var = tk.StringVar(value='left')
+        self._btn_left  = self._sel_btn(sel, '◀  Left',  'left')
+        self._btn_right = self._sel_btn(sel, 'Right  ▶', 'right')
+        self._refresh_mirror_btns()
+
+        self._btn_right.configure(
+            state='disabled',
+            fg_color='#141E2B', text_color='#3A4A5A',
+            border_color='#1E2A38', hover_color='#141E2B',
+        )
+        ctk.CTkLabel(sel, text='(Non connecté)', text_color='#3A4A5A',
+                     fg_color='transparent',
+                     font=ctk.CTkFont(family='Helvetica', size=9)
+                     ).pack(pady=(0, 20))
+
+        # Carte pavé directionnel
+        dpad_outer = ctk.CTkFrame(content, corner_radius=15, fg_color=CARD_CTK)
+        dpad_outer.grid(row=0, column=1, sticky='nsew')
+
+        ctk.CTkLabel(dpad_outer, text='Mirror Alignment', text_color=SUB,
+                     font=ctk.CTkFont(family='Helvetica', size=10)
+                     ).pack(pady=(20, 14))
+
+        self._make_dpad(dpad_outer, self._motor).pack()
+
+        self._motor_counter_label = ctk.CTkLabel(
+            dpad_outer, text='→ 0 ms   ↓ 0 ms',
+            text_color=SUB,
+            font=ctk.CTkFont(family='Helvetica', size=10),
+        )
+        self._motor_counter_label.pack(pady=(14, 20))
+
+        return page
+
+    def _sel_btn(self, parent, label: str, value: str) -> ctk.CTkButton:
+        btn = ctk.CTkButton(
+            parent, text=label,
+            width=160, height=44, corner_radius=10,
+            fg_color='transparent', text_color=SUB,
+            border_width=1, border_color='#2A3A4A',
+            hover_color=NAV_ACT,
+            font=ctk.CTkFont(family='Helvetica', size=12),
+            command=lambda v=value: self._select_mirror(v),
+        )
+        btn.pack(pady=5, padx=16)
+        return btn
+
+    def _select_mirror(self, value: str):
+        self._mirror_var.set(value)
+        self._refresh_mirror_btns()
+
+    def _refresh_mirror_btns(self):
+        active = self._mirror_var.get()
+        if active == 'left':
+            self._btn_left.configure(
+                fg_color=CYAN, text_color=BG, border_color=CYAN,
+                font=ctk.CTkFont(family='Helvetica', size=12, weight='bold'),
+            )
+        else:
+            self._btn_left.configure(
+                fg_color='transparent', text_color=SUB, border_color='#2A3A4A',
+                font=ctk.CTkFont(family='Helvetica', size=12),
+            )
+
+    def _motor(self, direction: str):
         if self.on_motor_manual:
             self.on_motor_manual(direction)
 
-    def _on_calibrate_zero_click(self):
-        """Déclenché par le bouton 'Fixer le point Zéro'. Lier self.on_calibrate_zero dans main.py."""
-        if self.on_calibrate_zero:
-            self.on_calibrate_zero()
+    def _make_dpad(self, parent, cmd_fn) -> ctk.CTkFrame:
+        """Pavé directionnel EV-OS — placement pixel par pixel via place().
+        On abandonne grid() : CTkFrame possède un canvas interne qui court-circuite
+        columnconfigure/uniform, ce qui rendait ◄ systématiquement plus étroit.
+        """
+        _BTN_BG = '#1E2D3D'
+        _SZ   = 60           # côté du bouton carré
+        _PAD  = 5            # espace entre boutons
+        _CELL = _SZ + _PAD   # taille d'une cellule virtuelle (65 px)
+        _W    = _CELL * 3    # largeur totale du frame (195 px)
+
+        # Frame de taille fixe explicite — pack_propagate(False) empêche
+        # les enfants de redimensionner le conteneur.
+        frame = ctk.CTkFrame(parent, fg_color='transparent',
+                             width=_W, height=_W)
+        frame.pack_propagate(False)
+
+        _BTN_KW = dict(
+            width=_SZ, height=_SZ, corner_radius=10,
+            fg_color=_BTN_BG, text_color=CYAN,
+            hover_color=CYAN, border_width=0,
+            anchor='center',
+            font=ctk.CTkFont(family='Helvetica', size=22, weight='bold'),
+        )
+
+        # Centre de chaque cellule virtuelle
+        def _cx(col: int) -> int: return col * _CELL + _CELL // 2
+        def _cy(row: int) -> int: return row * _CELL + _CELL // 2
+
+        btn_up    = ctk.CTkButton(frame, text='▲', command=lambda: cmd_fn('up'),    **_BTN_KW)
+        btn_left  = ctk.CTkButton(frame, text='◀', command=lambda: cmd_fn('left'),  **_BTN_KW)
+        btn_right = ctk.CTkButton(frame, text='►', command=lambda: cmd_fn('right'), **_BTN_KW)
+        btn_down  = ctk.CTkButton(frame, text='▼', command=lambda: cmd_fn('down'),  **_BTN_KW)
+
+        btn_up   .place(x=_cx(1), y=_cy(0), anchor='center')  # row 0 col 1
+        btn_left .place(x=_cx(0), y=_cy(1), anchor='center')  # row 1 col 0
+        btn_right.place(x=_cx(2), y=_cy(1), anchor='center')  # row 1 col 2
+        btn_down .place(x=_cx(1), y=_cy(2), anchor='center')  # row 2 col 1
+
+        ctk.CTkLabel(frame, text='◉', text_color='#2A3F52', fg_color=_BTN_BG,
+                     width=_SZ, height=_SZ, anchor='center',
+                     font=ctk.CTkFont(size=14),
+                     ).place(x=_cx(1), y=_cy(1), anchor='center')  # row 1 col 1
+
+        def _on_enter(e, b):
+            try:
+                b.configure(text_color=BG)
+            except Exception:
+                pass
+
+        def _on_leave(e, b):
+            try:
+                b.configure(text_color=CYAN)
+            except Exception:
+                pass
+
+        for btn in (btn_up, btn_left, btn_right, btn_down):
+            btn.bind('<Enter>', lambda e, b=btn: _on_enter(e, b))
+            btn.bind('<Leave>', lambda e, b=btn: _on_leave(e, b))
+
+        return frame
+
+    def show_enroll_panel(self, person_id: str):
+        """Affiche le panneau d'assistant d'enrôlement dans Settings."""
+        self._enroll_name_label.configure(text=f'Enrôlement : {person_id}')
+        self._enroll_counter_label.configure(text='→ 0 ms   ↓ 0 ms')
+        self._driver_register_btn.grid_remove()
+        self._driver_separator.grid_remove()
+        self._driver_zero_btn.grid_remove()
+        self._enroll_panel.grid()
+
+    def hide_enroll_panel(self):
+        """Masque le panneau d'enrôlement et restaure les boutons principaux."""
+        self._enroll_panel.grid_remove()
+        self._driver_register_btn.grid()
+        self._driver_separator.grid()
+        self._driver_zero_btn.grid()
+
+    def update_motor_counters(self, droite: int, bas: int):
+        """Met à jour les compteurs (Vehicle + panneau enrôlement)."""
+        text = f'→ {droite} ms   ↓ {bas} ms'
+        if hasattr(self, '_motor_counter_label'):
+            self._motor_counter_label.configure(text=text)
+        if hasattr(self, '_enroll_counter_label'):
+            self._enroll_counter_label.configure(text=text)
+
+    # ── PAGE MEDIA ────────────────────────────────────────────────────────────
+    def _make_media_page(self, parent) -> ctk.CTkFrame:
+        page = ctk.CTkFrame(parent, fg_color=BG, corner_radius=0)
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(0, weight=1)
+
+        center = ctk.CTkFrame(page, fg_color=BG, corner_radius=0)
+        center.place(relx=0.5, rely=0.5, anchor='center')
+
+        # Album art simulé
+        art = ctk.CTkFrame(center, fg_color=CARD_CTK, width=210, height=210,
+                           corner_radius=16)
+        art.pack(pady=(0, 18))
+        art.pack_propagate(False)
+        ctk.CTkLabel(art, text='🎵', fg_color='transparent',
+                     font=ctk.CTkFont(size=80)
+                     ).place(relx=0.5, rely=0.5, anchor='center')
+
+        self._media_title = ctk.CTkLabel(
+            center, text='En attente...', text_color=TEXT, wraplength=380,
+            font=ctk.CTkFont(family='Helvetica', size=22, weight='bold'),
+        )
+        self._media_title.pack(pady=(0, 4))
+        self._media_artist = ctk.CTkLabel(
+            center, text='—', text_color=SUB,
+            font=ctk.CTkFont(family='Helvetica', size=13),
+        )
+        self._media_artist.pack(pady=(0, 28))
+
+        # Contrôles
+        ctrl = ctk.CTkFrame(center, fg_color='transparent', corner_radius=0)
+        ctrl.pack()
+
+        _skip = dict(
+            width=56, height=56, corner_radius=28,
+            fg_color='transparent', hover_color=NAV_ACT,
+            font=ctk.CTkFont(size=22),
+        )
+        ctk.CTkButton(ctrl, text='⏮', text_color=SUB,
+                      command=lambda: self.on_prev and self.on_prev(),
+                      **_skip).pack(side='left', padx=14)
+        self._media_toggle = ctk.CTkButton(
+            ctrl, text='▶', text_color=BG,
+            width=68, height=68, corner_radius=34,
+            fg_color=CYAN, hover_color='#00b8cc',
+            font=ctk.CTkFont(size=28, weight='bold'),
+            command=lambda: self.on_toggle and self.on_toggle(),
+        )
+        self._media_toggle.pack(side='left', padx=14)
+        ctk.CTkButton(ctrl, text='⏭', text_color=SUB,
+                      command=lambda: self.on_next and self.on_next(),
+                      **_skip).pack(side='left', padx=14)
+
+        return page
+
+    # ── PAGE SETTINGS ─────────────────────────────────────────────────────────
+    def _make_settings_page(self, parent) -> ctk.CTkFrame:
+        page = ctk.CTkFrame(parent, fg_color=BG, corner_radius=0)
+        page.columnconfigure(0, weight=1)
+        page.columnconfigure(1, weight=1)
+        page.rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(page, text='  Settings', text_color=TEXT,
+                     font=ctk.CTkFont(family='Helvetica', size=18, weight='bold')
+                     ).grid(row=0, column=0, columnspan=2, sticky='w',
+                            padx=24, pady=(20, 14))
+
+        # ── Carte Wi-Fi ────────────────────────────────────────────────────────
+        wifi_card = ctk.CTkFrame(page, corner_radius=15, fg_color=CARD_CTK)
+        wifi_card.grid(row=1, column=0, sticky='nsew', padx=(24, 8), pady=(0, 20))
+        wifi_card.columnconfigure(0, weight=1)
+        wifi_card.rowconfigure(2, weight=1)
+
+        ctk.CTkLabel(wifi_card, text='🌐  Configuration Wi-Fi',
+                     text_color=CYAN,
+                     font=ctk.CTkFont(family='Helvetica', size=12, weight='bold')
+                     ).grid(row=0, column=0, sticky='w', padx=16, pady=(14, 8))
+
+        ctk.CTkButton(wifi_card, text='🔍  Scanner les réseaux disponibles',
+                      height=42, corner_radius=10,
+                      fg_color=NAV_ACT, text_color=CYAN,
+                      hover_color='#1E4A5A',
+                      font=ctk.CTkFont(family='Helvetica', size=11, weight='bold'),
+                      command=lambda: self.on_scan_wifi and self.on_scan_wifi()
+                      ).grid(row=1, column=0, sticky='ew', padx=16, pady=(0, 8))
+
+        # Listbox Wi-Fi (tk.Listbox — aucun équivalent CTk disponible)
+        list_frame = tk.Frame(wifi_card, bg=ENTRY_BG, bd=0)
+        list_frame.grid(row=2, column=0, sticky='nsew', padx=16, pady=(0, 8))
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        self._wifi_listbox = tk.Listbox(
+            list_frame,
+            bg=ENTRY_BG, fg=TEXT, selectbackground=NAV_ACT, selectforeground=CYAN,
+            font=('Helvetica', 11), bd=0, highlightthickness=1,
+            highlightcolor=CYAN, highlightbackground=ENTRY_BG,
+            activestyle='none',
+        )
+        self._wifi_listbox.grid(row=0, column=0, sticky='nsew')
+
+        scroll = ttk.Scrollbar(list_frame, orient='vertical',
+                               command=self._wifi_listbox.yview)
+        scroll.grid(row=0, column=1, sticky='ns')
+        self._wifi_listbox.config(yscrollcommand=scroll.set)
+
+        # Mot de passe (CTkEntry)
+        ctk.CTkLabel(wifi_card, text='Mot de passe :',
+                     text_color=SUB,
+                     font=ctk.CTkFont(family='Helvetica', size=10)
+                     ).grid(row=3, column=0, sticky='w', padx=16, pady=(4, 0))
+
+        self._wifi_pw_entry = ctk.CTkEntry(
+            wifi_card,
+            show='*', height=38, corner_radius=10,
+            fg_color=ENTRY_BG, border_color='#2A3A4A',
+            text_color=TEXT,
+            placeholder_text='••••••••',
+            font=ctk.CTkFont(family='Helvetica', size=11),
+        )
+        self._wifi_pw_entry.grid(row=4, column=0, sticky='ew',
+                                 padx=16, pady=(4, 8))
+
+        ctk.CTkButton(wifi_card, text='⚡  Connexion',
+                      height=44, corner_radius=10,
+                      fg_color=CYAN, text_color=BG,
+                      hover_color='#00b8cc',
+                      font=ctk.CTkFont(family='Helvetica', size=12, weight='bold'),
+                      command=lambda: self.on_connect_wifi and self.on_connect_wifi()
+                      ).grid(row=5, column=0, sticky='ew', padx=16, pady=(0, 8))
+
+        self._wifi_status_label = ctk.CTkLabel(
+            wifi_card, text='', text_color=SUB, anchor='w', wraplength=300,
+            font=ctk.CTkFont(family='Helvetica', size=10),
+        )
+        self._wifi_status_label.grid(row=6, column=0, sticky='ew',
+                                     padx=16, pady=(0, 12))
+
+        # ── Carte Conducteurs ──────────────────────────────────────────────────
+        driver_card = ctk.CTkFrame(page, corner_radius=15, fg_color=CARD_CTK)
+        driver_card.grid(row=1, column=1, sticky='nsew', padx=(8, 24), pady=(0, 20))
+        driver_card.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(driver_card, text='👤  Gestion des Conducteurs',
+                     text_color=CYAN,
+                     font=ctk.CTkFont(family='Helvetica', size=12, weight='bold')
+                     ).grid(row=0, column=0, columnspan=2, sticky='w',
+                            padx=16, pady=(14, 16))
+
+        self._driver_register_btn = ctk.CTkButton(
+            driver_card, text='✅  Enregistrer Nouveau Conducteur',
+            height=46, corner_radius=10,
+            fg_color=CYAN, text_color=BG, hover_color='#00b8cc',
+            font=ctk.CTkFont(family='Helvetica', size=11, weight='bold'),
+            command=lambda: self.on_enroll_user and self.on_enroll_user()
+        )
+        self._driver_register_btn.grid(row=1, column=0, columnspan=2,
+                                       sticky='ew', padx=16, pady=(0, 12))
+
+        self._driver_separator = ctk.CTkFrame(
+            driver_card, fg_color=NAV_ACT, height=1, corner_radius=0,
+        )
+        self._driver_separator.grid(row=2, column=0, columnspan=2,
+                                    sticky='ew', padx=16, pady=(4, 12))
+
+        self._driver_zero_btn = ctk.CTkButton(
+            driver_card, text='🎯  Fixer le Point Zéro Moteurs',
+            height=40, corner_radius=10,
+            fg_color='transparent', text_color=SUB,
+            border_width=1, border_color='#2A3A4A', hover_color=NAV_ACT,
+            font=ctk.CTkFont(family='Helvetica', size=10),
+            command=lambda: self.on_calibrate_zero and self.on_calibrate_zero()
+        )
+        self._driver_zero_btn.grid(row=3, column=0, columnspan=2,
+                                   sticky='ew', padx=16, pady=(0, 16))
+
+        # ── Panneau assistant d'enrôlement (caché par défaut) ─────────────────
+        self._enroll_panel = ctk.CTkFrame(driver_card, fg_color=CARD_CTK,
+                                          corner_radius=0)
+        self._enroll_panel.grid(row=4, column=0, columnspan=2, sticky='ew')
+        self._enroll_panel.grid_remove()
+
+        self._enroll_name_label = ctk.CTkLabel(
+            self._enroll_panel, text='Enrôlement : —',
+            text_color=CYAN,
+            font=ctk.CTkFont(family='Helvetica', size=11, weight='bold'),
+        )
+        self._enroll_name_label.pack(pady=(12, 10))
+
+        self._make_dpad(self._enroll_panel, self._motor).pack()
+
+        self._enroll_counter_label = ctk.CTkLabel(
+            self._enroll_panel, text='→ 0 ms   ↓ 0 ms',
+            text_color=SUB,
+            font=ctk.CTkFont(family='Helvetica', size=10),
+        )
+        self._enroll_counter_label.pack(pady=(8, 10))
+
+        ctk.CTkButton(self._enroll_panel, text='💾  Sauvegarder le Profil',
+                      height=44, corner_radius=10,
+                      fg_color=CYAN, text_color=BG, hover_color='#00b8cc',
+                      font=ctk.CTkFont(family='Helvetica', size=11, weight='bold'),
+                      command=lambda: self.on_save_enroll and self.on_save_enroll()
+                      ).pack(fill='x', padx=16, pady=(0, 8))
+
+        ctk.CTkButton(self._enroll_panel, text='✖  Annuler',
+                      height=38, corner_radius=10,
+                      fg_color='transparent', text_color=SUB,
+                      border_width=1, border_color='#2A3A4A', hover_color=NAV_ACT,
+                      font=ctk.CTkFont(family='Helvetica', size=10),
+                      command=lambda: self.on_cancel_enroll and self.on_cancel_enroll()
+                      ).pack(fill='x', padx=16, pady=(0, 12))
+
+        return page
+
+    # ── Recherche carte ───────────────────────────────────────────────────────
+    def _on_search_focus_in(self, _event):
+        pass  # CTkEntry gère le placeholder nativement
+
+    def _on_search_focus_out(self, _event):
+        pass  # CTkEntry gère le placeholder nativement
+
+    def _on_map_search(self):
+        if not self._map_widget or not _geocoder:
+            return
+        query = self._search_entry.get().strip()
+        if not query:
+            return
+        try:
+            result = _geocoder.osm(query, headers={'User-Agent': 'SbarroCockpitApp/1.0'})
+            if result.ok:
+                self._map_widget.set_position(result.lat, result.lng)
+                self._map_widget.set_zoom(13)
+            else:
+                logger.warning(f"_on_map_search : aucun résultat pour « {query} »")
+        except Exception as e:
+            logger.warning(f"_on_map_search : {e}")
+
+    # ── Horloge ───────────────────────────────────────────────────────────────
+    def _update_clock(self):
+        now = datetime.now()
+        self._clock_label.configure(text=now.strftime('%H:%M:%S'))
+        self._date_label.configure(text=now.strftime('%A %d %B %Y'))
+        self.root.after(1000, self._update_clock)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+    def update_weather(self, text: str):
+        self._weather_label.configure(text=text)
+
+    def update_network_status(self, online: bool):
+        if online:
+            self._network_label.configure(text='📶 Connecté', text_color=CYAN)
+        else:
+            self._network_label.configure(
+                text='⚠️ Hors ligne — Activez le partage 4G/5G',
+                text_color='#FF4444',
+            )
+
+    def update_wifi_list(self, networks: list):
+        self._wifi_listbox.delete(0, 'end')
+        for net in networks:
+            self._wifi_listbox.insert('end', f'  {net}')
+
+    def get_selected_ssid(self) -> str:
+        sel = self._wifi_listbox.curselection()
+        return self._wifi_listbox.get(sel[0]).strip() if sel else ''
+
+    def get_wifi_password(self) -> str:
+        return self._wifi_pw_entry.get()
+
+    def update_wifi_status(self, text: str, error: bool = False):
+        self._wifi_status_label.configure(
+            text=text, text_color='#FF4444' if error else CYAN,
+        )
+
+    def update_status(self, text: str):
+        if not isinstance(text, str):
+            text = str(text)
+        self._status_label.configure(text=text)
+
+    def update_track_ui(self, title: str, artist: str, is_playing: bool):
+        icon = '⏸' if is_playing else '▶'
+        self._bar_title.configure(text=title)
+        self._bar_artist.configure(text=artist)
+        self._bar_toggle.configure(text=icon)
+        self._media_title.configure(text=title)
+        self._media_artist.configure(text=artist)
+        self._media_toggle.configure(text=icon)
+
+    def update_image(self, frame: Optional[np.ndarray]):
+        if frame is None:
+            self.video_label.config(image='')
+            self.video_label.image = None
+            return
+        if not isinstance(frame, np.ndarray) or frame.ndim != 3:
+            logger.warning('Invalid frame passed to update_image.')
+            return
+        try:
+            w = self.video_label.winfo_width()
+            h = self.video_label.winfo_height()
+            if w <= 10 or h <= 10:
+                w, h = 640, 480
+            ih, iw = frame.shape[:2]
+            scale  = min(w / iw, h / ih)
+            nw     = max(1, int(iw * scale))
+            nh     = max(1, int(ih * scale))
+            if abs(nw - self._last_img_size[0]) > 2 or abs(nh - self._last_img_size[1]) > 2:
+                self._last_img_size = (nw, nh)
+            resized = cv2.resize(frame, self._last_img_size, interpolation=cv2.INTER_AREA)
+            imgtk   = ImageTk.PhotoImage(
+                image=Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)))
+            self.video_label.config(image=imgtk)
+            self.video_label.image = imgtk  # GC guard
+        except Exception as e:
+            logger.error(f'update_image error: {e}', exc_info=True)
+            self.video_label.config(image='')
+            self.video_label.image = None
+
+    # ── GIF marqueur de position ──────────────────────────────────────────────
+    def load_animated_gif(self, path: str):
+        """Extrait toutes les frames du GIF redimensionnées en 40×40."""
+        self.marker_frames = []
+        try:
+            gif = Image.open(path)
+            while True:
+                frame = gif.copy().convert('RGBA').resize(
+                    (40, 40), Image.Resampling.LANCZOS)
+                self.marker_frames.append(ImageTk.PhotoImage(frame))
+                gif.seek(gif.tell() + 1)
+        except EOFError:
+            pass
+        except FileNotFoundError:
+            logger.info(f'GIF marqueur absent : {path}')
+        except Exception as e:
+            logger.warning(f'load_animated_gif : {e}')
+        if self.marker_frames:
+            logger.info(f'GIF chargé : {len(self.marker_frames)} frame(s) — {path}')
+
+    def animate_marker(self, frame_index: int = 0):
+        """Boucle GIF 100 ms sur le label topbar."""
+        if not self.marker_frames:
+            return
+        frame = self.marker_frames[frame_index]
+        self._position_marker_label.config(image=frame)
+        self._position_marker_label.image = frame  # GC guard
+        self.root.after(100, self.animate_marker,
+                        (frame_index + 1) % len(self.marker_frames))
+
+    def show_map_fullscreen(self):
+        """Cache l'overlay vidéo — carte GPS en plein écran."""
+        self._video_overlay.place_forget()
+        self._change_driver_btn.place(relx=1.0, rely=1.0, anchor='se', x=-14, y=-14)
+
+    def show_video_feed(self):
+        """Restaure l'overlay vidéo sur la carte."""
+        self.video_label.config(image='')
+        self.video_label.image = None
+        self._change_driver_btn.place_forget()
+        self._video_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+    def set_map_position(self, lat: float, lon: float, label: str = ''):
+        """Centre la carte et pose un marqueur."""
+        if not self._map_widget:
+            return
+        try:
+            self._map_widget.delete_all_marker()
+            self._current_marker = None
+            self._map_widget.set_position(lat, lon)
+            self._map_widget.set_zoom(14)
+            if label:
+                self._current_marker = self._map_widget.set_marker(
+                    lat, lon, text=label)
+        except Exception as e:
+            logger.warning(f'set_map_position : {e}')

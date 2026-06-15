@@ -1,10 +1,10 @@
 {
-  "Charles": {
-    "tempsDroite": 800,
-    "tempsBas": 1700
-  },
-  "Mohamed": {
-    "tempsDroite": 2300,
-    "tempsBas": 500
-}
+    "Charles": {
+        "tempsDroite": 1500,
+        "tempsBas": 500
+    },
+    "Mohammed": {
+        "tempsDroite": 2300,
+        "tempsBas": 500
+    }
 }

@@ -9,6 +9,9 @@ import numpy as np
 import logging
 import json
 import os
+import platform
+import subprocess
+import threading
 from typing import Optional, Tuple, Dict, Any
 
 # --- Setup Logging First ---
@@ -29,8 +32,12 @@ from src.gui import FaceRecognitionGUI
 from src import config # Import configuration
 from src.utils import check_image_quality, draw_detection, estimate_pose
 from src.hardware_comm import ESP32Communicator
+from src.spotify_mgr import SpotifyManager
+from src import weather_mgr
 
 logger = logging.getLogger(__name__)
+
+STEP_MS = 100  # Durée d'un pas moteur par clic (ms)
 
 # --- Main Application Class ---
 class RecognitionApp:
@@ -49,16 +56,22 @@ class RecognitionApp:
         self.utilisateurs_coords = {}
         self._load_utilisateurs_json()
         self.esp32_comm = ESP32Communicator()
+        self.spotify = SpotifyManager()
 
         # Application state
         self.is_enrolling = False
         self.is_authenticated = False
+        self.current_temps_droite = 0
+        self.current_temps_bas = 0
+        self._enroll_person_id: Optional[str] = None
+        self._last_online = False
         self.state: Dict[str, Any] = {
             "last_detection_time": 0.0,
             "last_save_time": time.time(),
+            "last_spotify_update": 0.0,
             "current_status": "Initializing...",
             "running": True,
-            "last_processed_frame": None # Store the frame with drawings
+            "last_processed_frame": None,
         }
 
         if not self._initialize_components():
@@ -75,12 +88,21 @@ class RecognitionApp:
 
         # Setup GUI and Video Capture
         self.gui = FaceRecognitionGUI(root)
-        self.gui.on_motor_manual = self._on_motor_manual
+        self.gui.on_enroll_user    = self._on_enroll_click
+        self.gui.on_motor_manual   = self._on_motor_manual
         self.gui.on_calibrate_zero = self._on_calibrate_zero
+        self.gui.on_prev           = self.spotify.prev_track
+        self.gui.on_toggle         = self.spotify.toggle_play_pause
+        self.gui.on_next           = self.spotify.next_track
+        self.gui.on_scan_wifi      = self._scan_wifi
+        self.gui.on_connect_wifi   = self._connect_wifi
+        self.gui.on_reset_user     = self._on_reset_user
+        self.gui.on_save_enroll    = self._on_save_enroll
+        self.gui.on_cancel_enroll  = self._on_cancel_enroll
         self._setup_video_capture()
 
         # Set close protocol
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
     def _load_utilisateurs_json(self):
         """Loads user coordinates from data/utilisateurs.json."""
@@ -109,70 +131,86 @@ class RecognitionApp:
             logger.error(f"Error saving {json_path}: {e}")
             return False
 
-    def _enroll_new_user(self, temps_droite, temps_bas):
-        """Procédure d'enrôlement pour un nouvel utilisateur."""
-        self.is_enrolling = True
-        self.gui.update_status("ENRÔLEMENT EN COURS...")
-        
-        # 1. Demander le nom
-        person_id = simpledialog.askstring("Nouveau Conducteur", "Entrez le nom du nouveau conducteur :", parent=self.root)
-        
-        if not person_id:
-            logger.info("Enrôlement annulé (pas de nom fourni).")
-            self.is_enrolling = False
+    def _on_enroll_click(self):
+        """Demande le nom du conducteur puis ouvre le panneau d'assistant d'enrôlement."""
+        person_id = simpledialog.askstring(
+            "Nouveau Conducteur", "Entrez le nom du nouveau conducteur :", parent=self.root
+        )
+        if not person_id or not person_id.strip():
             return
+        self._enroll_person_id = person_id.strip()
+        self.current_temps_droite = 0
+        self.current_temps_bas = 0
+        self.is_enrolling = True
+        self.gui.update_motor_counters(0, 0)
+        self.gui.show_enroll_panel(self._enroll_person_id)
+        logger.info(f"Assistant d'enrôlement ouvert pour '{self._enroll_person_id}'.")
 
-        person_id = person_id.strip()
-        
-        # 2. Capturer une image de qualité
-        logger.info(f"Démarrage de la capture pour {person_id}...")
-        start_enroll_time = time.time()
-        timeout = 10 # 10 secondes pour trouver un visage
-        
-        captured_embedding = None
-        
-        while time.time() - start_enroll_time < timeout:
-            ret, frame = self.cap.read()
-            if not ret: continue
-            
-            bboxes, landmarks = self.detector.detect_faces(frame)
-            if bboxes is not None and len(bboxes) > 0:
-                # Prendre le premier visage pour simplifier
-                landmark = landmarks[0]
-                embedding_result = self.embedder.get_embedding(frame, landmark, return_aligned=True)
-                
-                if embedding_result and embedding_result[0] is not None:
-                    embedding, aligned_face = embedding_result
-                    if check_image_quality(aligned_face):
-                        captured_embedding = embedding
-                        logger.info(f"Visage capturé avec succès pour {person_id}.")
-                        break
-            
-            # Afficher le flux pendant la capture
-            self.gui.update_image(frame)
-            self.root.update()
-            time.sleep(0.01)
+    def _on_save_enroll(self):
+        """Capture le visage en arrière-plan et sauvegarde le profil avec les compteurs cumulés."""
+        if not self._enroll_person_id:
+            return
+        person_id = self._enroll_person_id
+        temps_droite = self.current_temps_droite
+        temps_bas = self.current_temps_bas
+        self.gui.update_status(f"Capture du visage de {person_id}…")
+        logger.info(f"Démarrage capture pour '{person_id}' — droite={temps_droite} ms, bas={temps_bas} ms")
 
-        if captured_embedding is not None:
-            # 3. Sauvegarder l'embedding
-            self.db.add_embedding(person_id, captured_embedding)
-            self.db.save_to_file()
-            
-            # 4. Sauvegarder les réglages moteurs
-            self.utilisateurs_coords[person_id] = {
-                "tempsDroite": temps_droite,
-                "tempsBas": temps_bas
-            }
-            self._save_utilisateurs_json()
-            
-            self.dernier_utilisateur_actif = person_id
-            self.gui.update_status(f"Bienvenue {person_id} !")
-            logger.info(f"Profil complet créé pour {person_id}.")
-        else:
-            self.gui.update_status("Erreur : Aucun visage détecté.")
-            logger.error("Échec de l'enrôlement : timeout ou mauvaise qualité.")
+        def _capture():
+            try:
+                start = time.time()
+                captured_embedding = None
+                while time.time() - start < 10:
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        time.sleep(0.01)
+                        continue
+                    bboxes, landmarks = self.detector.detect_faces(frame)
+                    if bboxes is not None and len(bboxes) > 0:
+                        result = self.embedder.get_embedding(frame, landmarks[0], return_aligned=True)
+                        if result and result[0] is not None:
+                            embedding, aligned_face = result
+                            if check_image_quality(aligned_face):
+                                captured_embedding = embedding
+                                logger.info(f"Visage capturé pour '{person_id}'.")
+                                break
+                    self.root.after(0, lambda f=frame: self.gui.update_image(f))
+                    time.sleep(0.01)
 
+                if captured_embedding is not None:
+                    self.db.add_embedding(person_id, captured_embedding)
+                    self.db.save_to_file()
+                    self.utilisateurs_coords[person_id] = {
+                        "tempsDroite": temps_droite,
+                        "tempsBas": temps_bas,
+                    }
+                    self._save_utilisateurs_json()
+                    self.dernier_utilisateur_actif = person_id
+                    self.root.after(0, lambda: self.gui.update_status(f"✅ {person_id} enregistré !"))
+                    self.root.after(0, self.gui.hide_enroll_panel)
+                    logger.info(f"Profil complet créé pour '{person_id}'.")
+                else:
+                    self.root.after(0, lambda: self.gui.update_status("❌ Aucun visage détecté. Réessayez."))
+                    logger.error(f"Échec capture pour '{person_id}' : timeout.")
+            except Exception as e:
+                logger.error(f"Erreur dans _on_save_enroll : {e}", exc_info=True)
+                self.root.after(0, lambda: self.gui.update_status("❌ Erreur de capture."))
+            finally:
+                self.is_enrolling = False
+                self._enroll_person_id = None
+
+        threading.Thread(target=_capture, daemon=True).start()
+
+    def _on_cancel_enroll(self):
+        """Annule l'enrôlement en cours et restaure l'interface."""
+        logger.info("Enrôlement annulé.")
         self.is_enrolling = False
+        self._enroll_person_id = None
+        self.current_temps_droite = 0
+        self.current_temps_bas = 0
+        self.gui.hide_enroll_panel()
+        self.gui.update_motor_counters(0, 0)
+        self.gui.update_status("Enrôlement annulé.")
 
     def _initialize_components(self) -> bool:
         """Initializes face detection, anti-spoofing, embedding, and recognition components."""
@@ -454,38 +492,230 @@ class RecognitionApp:
 
             action = msg.get("action")
             if action == "save_profile":
-                temps_droite = msg.get("tempsDroite", 0)
-                temps_bas = msg.get("tempsBas", 0)
-                
                 if self.dernier_utilisateur_actif is None:
-                    logger.info("Commande de sauvegarde reçue pour un utilisateur inconnu.")
-                    self._enroll_new_user(temps_droite, temps_bas)
+                    logger.info("Commande de sauvegarde reçue — ouverture de l'assistant d'enrôlement.")
+                    self._on_enroll_click()
                 else:
                     user = self.dernier_utilisateur_actif
-                    logger.info(f"Mise à jour des réglages pour {user}: R={temps_droite}, D={temps_bas}")
+                    logger.info(f"Mise à jour des réglages pour {user}: droite={self.current_temps_droite}, bas={self.current_temps_bas}")
                     self.utilisateurs_coords[user] = {
-                        "tempsDroite": temps_droite,
-                        "tempsBas": temps_bas
+                        "tempsDroite": self.current_temps_droite,
+                        "tempsBas": self.current_temps_bas
                     }
                     self._save_utilisateurs_json()
                     self.gui.update_status(f"Réglages mis à jour pour {user}")
         except Exception as e:
             logger.error(f"Erreur lors de la lecture des messages ESP32: {e}")
 
+    # ── Wi-Fi ─────────────────────────────────────────────────────────────────
+
+    def _scan_wifi(self):
+        """Lance le scan Wi-Fi dans un thread (nmcli sur Linux, simulation ailleurs)."""
+        self.gui.update_wifi_status("🔍 Scan en cours...")
+
+        def _worker():
+            networks = []
+            try:
+                if platform.system() == "Linux":
+                    result = subprocess.run(
+                        ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi", "list"],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    seen = set()
+                    for line in result.stdout.strip().splitlines():
+                        parts = line.split(":")
+                        ssid = parts[0].strip()
+                        if not ssid or ssid in seen:
+                            continue
+                        seen.add(ssid)
+                        signal = parts[1].strip() if len(parts) > 1 else "?"
+                        sec    = parts[2].strip() if len(parts) > 2 else ""
+                        lock   = "🔒" if sec else "🔓"
+                        networks.append(f"{lock} {ssid}  ({signal}%)")
+                else:
+                    # Mode simulation (macOS / Windows)
+                    import time as _t; _t.sleep(0.8)
+                    networks = [
+                        "🔒 iPhone de Charles  (89%)",
+                        "🔒 Réseau_Atelier  (72%)",
+                        "🔒 Livebox-SBARRO  (65%)",
+                        "🔓 Réseau_Public  (40%)",
+                        "🔒 EV-OS_Dev  (31%)",
+                    ]
+            except Exception as e:
+                logger.warning(f"_scan_wifi : {e}")
+                networks = ["⚠️ Erreur lors du scan"]
+            try:
+                count = len([n for n in networks if not n.startswith("⚠️")])
+                msg   = f"✅ {count} réseau(x) trouvé(s)" if count else "Aucun réseau trouvé."
+                self.root.after(0, lambda: self.gui.update_wifi_list(networks))
+                self.root.after(0, lambda: self.gui.update_wifi_status(msg))
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _connect_wifi(self):
+        """Tente de se connecter au réseau sélectionné (nmcli ou simulation)."""
+        raw  = self.gui.get_selected_ssid()
+        if not raw:
+            self.gui.update_wifi_status("⚠️ Sélectionnez d'abord un réseau.", error=True)
+            return
+
+        # Extraire le SSID propre (enlever icône et signal)
+        ssid = raw.lstrip("🔒🔓 ").split("  (")[0].strip()
+        password = self.gui.get_wifi_password()
+        self.gui.update_wifi_status(f"⏳ Connexion à « {ssid} »...")
+
+        def _worker():
+            msg, error = "", False
+            try:
+                if platform.system() == "Linux":
+                    cmd = ["nmcli", "dev", "wifi", "connect", ssid]
+                    if password:
+                        cmd += ["password", password]
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    if r.returncode == 0:
+                        msg = f"✅ Connecté à « {ssid} »"
+                    else:
+                        msg   = f"❌ Échec : {r.stderr.strip()[:80]}"
+                        error = True
+                else:
+                    import time as _t; _t.sleep(1.5)
+                    msg = f"✅ [Simulation] Connecté à « {ssid} »"
+            except Exception as e:
+                msg, error = f"❌ Erreur : {e}", True
+
+            try:
+                self.root.after(0, lambda: self.gui.update_wifi_status(msg, error=error))
+                if not error:
+                    self.root.after(2000, self._fetch_weather_async)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── Réseau & Météo ────────────────────────────────────────────────────────
+
+    def _update_network_and_weather(self):
+        """Démarre les deux boucles de rafraîchissement réseau (15s) et météo (15min)."""
+        self._check_network_loop()
+        self._weather_loop()
+
+    def _check_network_loop(self):
+        """Vérifie la connexion Internet toutes les 15s dans un thread dédié."""
+        def _worker():
+            online = weather_mgr.check_internet_connection()
+            try:
+                self.root.after(0, lambda: self._apply_network_status(online))
+            except Exception:
+                pass
+        threading.Thread(target=_worker, daemon=True).start()
+        self.root.after(15_000, self._check_network_loop)
+
+    def _apply_network_status(self, online: bool):
+        was_online = self._last_online
+        self._last_online = online
+        self.gui.update_network_status(online)
+        if online and not was_online:
+            logger.info("Connexion rétablie — mise à jour météo immédiate.")
+            self._fetch_weather_async()
+
+    def _weather_loop(self):
+        """Met à jour la météo toutes les 15 min dans un thread dédié."""
+        self._fetch_weather_async()
+        self.root.after(900_000, self._weather_loop)
+
+    def _fetch_weather_async(self):
+        """Récupère localisation + météo en arrière-plan et met à jour la GUI."""
+        def _worker():
+            try:
+                location = weather_mgr.get_current_location()
+                if location:
+                    weather_str = weather_mgr.get_weather(location['lat'], location['lon'])
+                    city = location.get('city', 'Inconnu')
+                    text = f"📍 {city}  {weather_str}"
+                else:
+                    text = "📍 --°C"
+            except Exception as e:
+                logger.warning(f"_fetch_weather_async : {e}")
+                text = "📍 --°C"
+            try:
+                self.root.after(0, lambda: self.gui.update_weather(text))
+            except Exception:
+                pass
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _on_motor_manual(self, direction: str):
-        """Envoie le caractère de commande moteur correspondant à la direction du pavé."""
+        """Envoie un pas moteur (STEP_MS ms) à l'ESP32 et met à jour les compteurs cumulés."""
         char_map = {"up": "H", "down": "B", "left": "G", "right": "D"}
         char = char_map.get(direction)
         if char is None:
             logger.warning(f"Direction inconnue reçue du pavé : {direction!r}")
             return
-        logger.info(f"Commande manuelle moteur : {direction} → '{char}'")
-        self.esp32_comm.send_raw(char)
+        if direction == "right":
+            self.current_temps_droite += STEP_MS
+        elif direction == "left":
+            self.current_temps_droite = max(0, self.current_temps_droite - STEP_MS)
+        elif direction == "down":
+            self.current_temps_bas += STEP_MS
+        elif direction == "up":
+            self.current_temps_bas = max(0, self.current_temps_bas - STEP_MS)
+        logger.info(
+            f"Pas moteur : {direction} → '{char}' {STEP_MS} ms  "
+            f"(cumul droite={self.current_temps_droite} ms, bas={self.current_temps_bas} ms)"
+        )
+        self.esp32_comm.send_raw(char + '\n')
+        self.gui.update_motor_counters(self.current_temps_droite, self.current_temps_bas)
 
     def _on_calibrate_zero(self):
-        """Envoie le caractère 'Z' à l'ESP32 pour fixer la position zéro des moteurs."""
-        logger.info("Calibration : envoi du point zéro 'Z' à l'ESP32.")
+        """Envoie 'Z' à l'ESP32 et réinitialise les compteurs de position à 0."""
+        logger.info("Calibration : point zéro fixé, compteurs remis à 0.")
+        self.current_temps_droite = 0
+        self.current_temps_bas = 0
         self.esp32_comm.send_raw("Z")
+        self.gui.update_motor_counters(0, 0)
+
+    def _center_map_on_location(self, person_id: str):
+        """Récupère la localisation GPS en arrière-plan et centre la carte dessus."""
+        def _worker():
+            try:
+                location = weather_mgr.get_current_location()
+                if location:
+                    lat   = location['lat']
+                    lon   = location['lon']
+                    city  = location.get('city', '')
+                    label = f"📍 {person_id}" + (f"  —  {city}" if city else "")
+                    self.root.after(0, lambda: self.gui.set_map_position(lat, lon, label))
+            except Exception as e:
+                logger.warning(f"_center_map_on_location : {e}")
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_reset_user(self):
+        """Réinitialise l'authentification, relance la caméra et restaure le scan vidéo."""
+        logger.info("Changement de conducteur — réinitialisation complète.")
+        self.esp32_comm.send_raw("0")
+
+        self.is_authenticated = False
+        self.current_temps_droite = 0
+        self.current_temps_bas = 0
+        self.gui.update_motor_counters(0, 0)
+        self.dernier_utilisateur_actif = None
+        self.state["current_status"] = "Scan du visage..."
+        self.state["last_processed_frame"] = None
+        self.state["last_detection_time"] = 0.0
+
+        if self.cap:
+            self.cap.release()
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            logger.error("Impossible de rouvrir la caméra après réinitialisation.")
+            self.gui.update_status("Erreur caméra — redémarrez l'application.")
+            return
+
+        self.gui.show_video_feed()
+        self.gui.update_status("Scan du visage...")
+        logger.info("Réinitialisation terminée — détection relancée.")
 
     def _update_gui_loop(self):
         """The main loop that reads frames and updates the GUI with intensive logging."""
@@ -502,6 +732,19 @@ class RecognitionApp:
 
             if self.is_enrolling:
                 logger.info("Skipping recognition (enrolling)...")
+                self.root.after(config.GUI_UPDATE_INTERVAL_MS, self._update_gui_loop)
+                return
+
+            # Authentifié — caméra déjà relâchée, on ne fait que les tâches de fond
+            if self.is_authenticated:
+                current_time = time.time()
+                if current_time - self.state["last_spotify_update"] >= 3.0:
+                    self.state["last_spotify_update"] = current_time
+                    info = self.spotify.get_current_track_info()
+                    self.gui.update_track_ui(info["title"], info["artist"], info["is_playing"])
+                if self.db and current_time - self.state["last_save_time"] > 300:
+                    self.db.save_if_dirty()
+                    self.state["last_save_time"] = current_time
                 self.root.after(config.GUI_UPDATE_INTERVAL_MS, self._update_gui_loop)
                 return
 
@@ -569,6 +812,20 @@ class RecognitionApp:
                         self.gui.update_status(welcome_msg)
                         logger.info(f"Authentification réussie : {person_id}. Envoi réglages ESP32.")
                         self.esp32_comm.send_auth_data(person_id, temps_droite, temps_bas)
+
+                        # Lancer la playlist personnalisée si définie
+                        user_data = self.utilisateurs_coords.get(person_id, {})
+                        playlist_id = user_data.get("playlist_id", "")
+                        if playlist_id:
+                            logger.info(f"Lancement playlist Spotify pour {person_id} : {playlist_id}")
+                            self.spotify.play_playlist(playlist_id)
+
+                        # Éteindre la LED webcam et afficher la carte GPS en plein écran
+                        if self.cap and self.cap.isOpened():
+                            self.cap.release()
+                            logger.info("Caméra relâchée après authentification.")
+                        self.gui.show_map_fullscreen()
+                        self._center_map_on_location(person_id)
                     else:
                         self.gui.update_status(self.state["current_status"])
                 else:
@@ -576,16 +833,18 @@ class RecognitionApp:
                     if self.state["last_processed_frame"] is not None:
                         frame_to_display = self.state["last_processed_frame"]
                     self.gui.update_status(self.state["current_status"])
-            else:
-                # Authentifié — pas de détection, flux vidéo brut, statut figé
-                frame_to_display = frame
-                self.gui.update_status(self.state["current_status"])
 
             # --- Update GUI Image ---
             if self.gui:
                 logger.info("Calling gui.update_image...")
                 self.gui.update_image(frame_to_display)
                 logger.info("gui.update_image finished.")
+
+            # --- Periodic Spotify track info update (toutes les 3s) ---
+            if current_time - self.state["last_spotify_update"] >= 3.0:
+                self.state["last_spotify_update"] = current_time
+                info = self.spotify.get_current_track_info()
+                self.gui.update_track_ui(info["title"], info["artist"], info["is_playing"])
 
             # --- Periodic Database Save ---
             if self.db and current_time - self.state["last_save_time"] > 300:
@@ -619,10 +878,30 @@ class RecognitionApp:
         self.root.update_idletasks()
         self.root.update()
 
+        # Démarrer les boucles réseau et météo (non-bloquant, threads démons)
+        self._update_network_and_weather()
+
+        # Charger le GIF de marqueur et lancer la boucle d'animation
+        marker_gif = os.path.join('assets', 'position_marker.gif')
+        self.gui.load_animated_gif(marker_gif)
+        self.gui.animate_marker()
+
         # Start the update loop
         self.root.after(1500, self._update_gui_loop) # Délai macOS : laisse les drivers caméra s'initialiser
         # Start Tkinter main loop
         self.root.mainloop()
+
+    def _on_closing(self):
+        """Retour à zéro des moteurs avant fermeture, puis cleanup complet."""
+        print("[INFO] Fermeture détectée. Envoi de la commande de retour au Zéro initial...")
+        try:
+            payload = json.dumps({"status": "shutdown"}) + "\n"
+            if self.esp32_comm.ser and self.esp32_comm.ser.is_open:
+                self.esp32_comm.ser.write(payload.encode('utf-8'))
+            time.sleep(2.0)
+        except Exception as e:
+            print(f"[ERREUR] Impossible d'envoyer le retour à zéro : {e}")
+        self._on_close()
 
     def _on_close(self):
         """Handles cleanup when the GUI window is closed."""
@@ -648,6 +927,20 @@ class RecognitionApp:
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    root = tk.Tk()
+    import customtkinter as ctk
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    root = ctk.CTk()
     app = RecognitionApp(root)
-    app.run()
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        print("\n[INFO] 'Control+C' détecté ! Lancement de la procédure de Home du rétroviseur...")
+        try:
+            if app.esp32_comm and app.esp32_comm.ser and app.esp32_comm.ser.is_open:
+                payload = json.dumps({"status": "shutdown"}) + "\n"
+                app.esp32_comm.ser.write(payload.encode('utf-8'))
+                time.sleep(2.0)
+        except Exception as e:
+            print(f"Impossible de ramener le rétro : {e}")
+        print("[INFO] Extinction propre du véhicule terminée.")

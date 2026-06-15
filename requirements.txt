@@ -85,3 +85,6 @@ tzdata==2025.2
 urllib3==2.3.0
 wcwidth==0.2.13
 pyserial>=3.5
+spotipy>=2.24.0
+tkintermapview>=1.29
+customtkinter>=5.2.0

@@ -1,0 +1,7 @@
+# Modèles lourds
+models.zip
+*.zip
+
+# Python cache
+__pycache__/
+*.pyc
