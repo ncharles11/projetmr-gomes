@@ -1,7 +1,9 @@
 # src/gui.py
 import tkinter as tk
 from tkinter import ttk
-from PIL import Image, ImageTk
+import io as _io
+import urllib.request
+from PIL import Image, ImageDraw, ImageTk
 from datetime import datetime
 import cv2
 import numpy as np
@@ -37,11 +39,159 @@ NAV_ACT  = '#1A3A4A'
 BLACK    = '#000000'
 
 
+# ── Pochette par défaut (vinyle sombre / accent cyan) ─────────────────────────
+
+def _make_placeholder_img(size: int = 200) -> Image.Image:
+    """Génère un disque vinyle stylisé aux couleurs du thème EV-OS."""
+    img  = Image.new('RGB', (size, size), (27, 43, 59))   # CARD_CTK
+    draw = ImageDraw.Draw(img)
+    c    = size // 2
+
+    # Disque extérieur noir
+    r_out = c - 4
+    draw.ellipse([c - r_out, c - r_out, c + r_out, c + r_out], fill=(10, 17, 24))
+
+    # Rainures vinyle (cercles concentriques discrets)
+    for r in range(r_out - 6, r_out - 36, -9):
+        draw.ellipse([c - r, c - r, c + r, c + r], outline=(18, 28, 38), width=1)
+
+    # Label central coloré
+    r_lbl = c // 3
+    draw.ellipse([c - r_lbl, c - r_lbl, c + r_lbl, c + r_lbl], fill=(13, 32, 44))
+    draw.ellipse([c - r_lbl, c - r_lbl, c + r_lbl, c + r_lbl],
+                 outline=(0, 229, 255), width=2)
+
+    # Trou central cyan
+    r_h = 7
+    draw.ellipse([c - r_h, c - r_h, c + r_h, c + r_h], fill=(0, 229, 255))
+
+    return img
+
+
+# ── Clavier virtuel CustomTkinter (pur Python, zéro dépendance système) ──────
+
+_AZERTY = [
+    ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
+    ['A', 'Z', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'],
+    ['Q', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 'M'],
+    ['W', 'X', 'C', 'V', 'B', 'N', '@', '.', '_', '-'],
+]
+
+_KB_H      = 48   # hauteur d'une touche (px)
+_KB_BTN_BG = '#1B2B3B'
+_KB_HOV    = '#1A3A4A'
+
+
+class CTkVirtualKeyboard(ctk.CTkFrame):
+    """Clavier AZERTY CustomTkinter autonome.
+
+    Usage :
+        kb.show(entry_widget)            # affiche + cible l'entrée
+        kb.show(entry, on_validate=fn)   # fn() appelée quand ✓ OK est pressé
+        kb.hide()                        # masque
+    """
+
+    def __init__(self, master):
+        super().__init__(master, fg_color=SIDEBAR, corner_radius=0)
+        self._target: Optional[ctk.CTkEntry] = None
+        self._on_validate_cb = None
+        self._build()
+
+    # ── Construction des touches ──────────────────────────────────────────────
+    def _build(self):
+        _kw = dict(
+            height=_KB_H, corner_radius=8,
+            fg_color=_KB_BTN_BG, hover_color=_KB_HOV,
+            text_color=TEXT,
+            font=ctk.CTkFont(family='Helvetica', size=15, weight='bold'),
+        )
+
+        for row_chars in _AZERTY:
+            row_frame = ctk.CTkFrame(self, fg_color='transparent')
+            row_frame.pack(fill='x', padx=6, pady=3)
+            for char in row_chars:
+                ctk.CTkButton(
+                    row_frame, text=char,
+                    command=lambda ch=char: self._press(ch),
+                    **_kw,
+                ).pack(side='left', expand=True, fill='x', padx=2)
+
+        # Ligne inférieure : Espace / ⌫ / ✓ OK
+        bot = ctk.CTkFrame(self, fg_color='transparent')
+        bot.pack(fill='x', padx=6, pady=(3, 6))
+
+        ctk.CTkButton(
+            bot, text='Espace',
+            height=_KB_H, corner_radius=8,
+            fg_color=_KB_BTN_BG, hover_color=_KB_HOV, text_color=TEXT,
+            font=ctk.CTkFont(family='Helvetica', size=13),
+            command=lambda: self._press(' '),
+        ).pack(side='left', expand=True, fill='x', padx=2)
+
+        ctk.CTkButton(
+            bot, text='⌫',
+            width=90, height=_KB_H, corner_radius=8,
+            fg_color='#2A2035', hover_color='#3A1525', text_color='#FF6B6B',
+            font=ctk.CTkFont(family='Helvetica', size=20),
+            command=self._backspace,
+        ).pack(side='left', padx=2)
+
+        ctk.CTkButton(
+            bot, text='✓  OK',
+            width=110, height=_KB_H, corner_radius=8,
+            fg_color=CYAN, hover_color='#00b8cc', text_color=BG,
+            font=ctk.CTkFont(family='Helvetica', size=13, weight='bold'),
+            command=self._validate,
+        ).pack(side='left', padx=2)
+
+    # ── Actions touches ───────────────────────────────────────────────────────
+    def _press(self, char: str):
+        if self._target is None:
+            return
+        try:
+            inner = self._target._entry      # tk.Entry sous-jacent
+            inner.insert('insert', char)
+        except Exception:
+            self._target.insert('end', char)
+
+    def _backspace(self):
+        if self._target is None:
+            return
+        try:
+            inner = self._target._entry
+            pos = inner.index('insert')
+            if pos > 0:
+                inner.delete(pos - 1, pos)
+        except Exception:
+            pass
+
+    def _validate(self):
+        if self._on_validate_cb:
+            self._on_validate_cb()
+        else:
+            self.hide()
+
+    # ── API publique ──────────────────────────────────────────────────────────
+    def show(self, target: ctk.CTkEntry, on_validate=None):
+        """Ancre le clavier en bas de la fenêtre parente et cible l'entrée."""
+        self._target = target
+        self._on_validate_cb = on_validate
+        self.place(relx=0, rely=1.0, anchor='sw', relwidth=1.0)
+        self.lift()
+
+    def hide(self):
+        self.place_forget()
+        self._target = None
+        self._on_validate_cb = None
+
+
 class FaceRecognitionGUI:
     def __init__(self, root: ctk.CTk):
         self.root = root
         self.root.title(config.GUI_WINDOW_TITLE)
         self.root.minsize(1100, 650)
+        self.root.attributes("-fullscreen", True)
+        self.root.bind("<Escape>", lambda e: self.root.attributes("-fullscreen", False))
 
         # Callbacks — liés depuis main.py
         self.on_enroll_user    = None
@@ -52,9 +202,10 @@ class FaceRecognitionGUI:
         self.on_next           = None
         self.on_scan_wifi      = None
         self.on_connect_wifi   = None
-        self.on_reset_user     = None
-        self.on_save_enroll    = None
-        self.on_cancel_enroll  = None
+        self.on_reset_user       = None
+        self.on_save_enroll      = None
+        self.on_cancel_enroll    = None
+        self.on_pair_bluetooth   = None
 
         self._active_page    = None
         self._pages          = {}
@@ -64,6 +215,7 @@ class FaceRecognitionGUI:
 
         self._load_sidebar_icons()
         self._build_layout()
+        self._vkb = CTkVirtualKeyboard(self.root)
         self._update_clock()
         logger.debug("GUI initialized.")
 
@@ -270,7 +422,8 @@ class FaceRecognitionGUI:
             font=ctk.CTkFont(family='Helvetica', size=11),
         )
         self._search_entry.pack(side='left', padx=(14, 0))
-        self._search_entry.bind('<Return>', lambda e: self._on_map_search())
+        self._search_entry.bind('<Return>', lambda e: (self._on_map_search(), self.hide_keyboard()))
+        self._search_entry.bind('<FocusIn>', lambda e: self.show_keyboard(self._search_entry), add='+')
 
         ctk.CTkButton(
             self._search_bar_frame, text='⌕',
@@ -532,20 +685,64 @@ class FaceRecognitionGUI:
     # ── PAGE MEDIA ────────────────────────────────────────────────────────────
     def _make_media_page(self, parent) -> ctk.CTkFrame:
         page = ctk.CTkFrame(parent, fg_color=BG, corner_radius=0)
-        page.columnconfigure(0, weight=1)
-        page.rowconfigure(0, weight=1)
 
-        center = ctk.CTkFrame(page, fg_color=BG, corner_radius=0)
+        # ── Carte Bluetooth ───────────────────────────────────────────────────
+        self._bt_card = ctk.CTkFrame(page, fg_color=CARD_CTK, corner_radius=12)
+        self._bt_card.pack(fill='x', padx=20, pady=(18, 0))
+
+        self._bt_status_label = ctk.CTkLabel(
+            self._bt_card,
+            text='📶  Bluetooth — en attente de connexion',
+            text_color=SUB,
+            wraplength=520,
+            font=ctk.CTkFont(family='Helvetica', size=12),
+        )
+        self._bt_status_label.pack(side='left', padx=16, pady=12)
+
+        self._bt_pair_btn = ctk.CTkButton(
+            self._bt_card, text='🔗  Associer un téléphone',
+            width=200, height=36, corner_radius=8,
+            fg_color=CYAN, hover_color='#00b8cc', text_color=BG,
+            font=ctk.CTkFont(family='Helvetica', size=11, weight='bold'),
+            command=lambda: self.on_pair_bluetooth and self.on_pair_bluetooth(),
+        )
+        self._bt_pair_btn.pack(side='right', padx=12)
+
+        # ── Zone lecteur (centrée dans l'espace restant) ──────────────────────
+        self._bt_player_area = ctk.CTkFrame(page, fg_color=BG, corner_radius=0)
+        self._bt_player_area.pack(fill='both', expand=True)
+        player_area = self._bt_player_area   # alias local pour la suite
+
+        # ── Toast de connexion (positionné sur page, initialement caché) ──────
+        self._bt_flash = ctk.CTkFrame(page, fg_color='#0D2B1E', corner_radius=14)
+        self._bt_flash_lbl = ctk.CTkLabel(
+            self._bt_flash,
+            text='',
+            text_color='#00E676',
+            font=ctk.CTkFont(family='Helvetica', size=15, weight='bold'),
+        )
+        self._bt_flash_lbl.pack(padx=24, pady=14)
+
+        center = ctk.CTkFrame(player_area, fg_color=BG, corner_radius=0)
         center.place(relx=0.5, rely=0.5, anchor='center')
 
-        # Album art simulé
-        art = ctk.CTkFrame(center, fg_color=CARD_CTK, width=210, height=210,
-                           corner_radius=16)
-        art.pack(pady=(0, 18))
-        art.pack_propagate(False)
-        ctk.CTkLabel(art, text='🎵', fg_color='transparent',
-                     font=ctk.CTkFont(size=80)
-                     ).place(relx=0.5, rely=0.5, anchor='center')
+        # Album art
+        self._media_art_frame = ctk.CTkFrame(
+            center, fg_color=CARD_CTK, width=210, height=210, corner_radius=16,
+        )
+        self._media_art_frame.pack(pady=(0, 18))
+        self._media_art_frame.pack_propagate(False)
+
+        _ph_img = _make_placeholder_img(200)
+        self._placeholder_ctk_img = ctk.CTkImage(
+            light_image=_ph_img, dark_image=_ph_img, size=(200, 200)
+        )
+        self._media_art_label = ctk.CTkLabel(
+            self._media_art_frame, text='', fg_color='transparent',
+            image=self._placeholder_ctk_img,
+        )
+        self._media_art_label.place(relx=0.5, rely=0.5, anchor='center')
+        self._last_art_url = None
 
         self._media_title = ctk.CTkLabel(
             center, text='En attente...', text_color=TEXT, wraplength=380,
@@ -651,6 +848,8 @@ class FaceRecognitionGUI:
         )
         self._wifi_pw_entry.grid(row=4, column=0, sticky='ew',
                                  padx=16, pady=(4, 8))
+        self._wifi_pw_entry.bind('<FocusIn>', lambda e: self.show_keyboard(self._wifi_pw_entry), add='+')
+        self._wifi_pw_entry.bind('<Return>',  lambda e: self.hide_keyboard(), add='+')
 
         ctk.CTkButton(wifi_card, text='⚡  Connexion',
                       height=44, corner_radius=10,
@@ -804,6 +1003,82 @@ class FaceRecognitionGUI:
             text=text, text_color='#FF4444' if error else CYAN,
         )
 
+    def update_bt_status(self, text: str, active: bool = False):
+        """Met à jour le label de statut Bluetooth.
+        active=True : texte en cyan (mode appairage) ; False : gris (veille).
+        """
+        if hasattr(self, '_bt_status_label'):
+            self._bt_status_label.configure(
+                text=text,
+                text_color=CYAN if active else SUB,
+            )
+
+    # ── Pochette d'album ──────────────────────────────────────────────────────
+
+    def update_cover_art(self, url: str):
+        """Déclenche le chargement de la pochette en arrière-plan.
+        Appel sans-effet si l'URL n'a pas changé depuis le dernier cycle.
+        """
+        if url == self._last_art_url:
+            return
+        self._last_art_url = url
+        import threading
+        threading.Thread(target=self._load_cover_art, args=(url,), daemon=True).start()
+
+    def _load_cover_art(self, url: str):
+        """Télécharge / ouvre l'image et met à jour le label via root.after().
+        Jamais appelé depuis le thread Tkinter.
+        """
+        try:
+            if not url:
+                raise ValueError("no url")
+            if url.startswith('file://'):
+                path = url[len('file://'):]
+                img  = Image.open(path)
+            elif url.startswith(('http://', 'https://')):
+                with urllib.request.urlopen(url, timeout=4) as resp:
+                    img = Image.open(_io.BytesIO(resp.read()))
+            else:
+                raise ValueError(f"format non supporté : {url}")
+            img      = img.convert('RGB').resize((200, 200), Image.LANCZOS)
+            ctk_img  = ctk.CTkImage(light_image=img, dark_image=img, size=(200, 200))
+        except Exception:
+            ctk_img = self._placeholder_ctk_img
+        self.root.after(0, lambda i=ctk_img: self._set_cover_art(i))
+
+    def _set_cover_art(self, ctk_img: ctk.CTkImage):
+        """Applique l'image au label (toujours sur le thread Tkinter)."""
+        if hasattr(self, '_media_art_label'):
+            self._media_art_label.configure(image=ctk_img)
+
+    def set_bt_connected(self, first_connection: bool = False):
+        """Cache la carte BT et affiche le toast si première connexion."""
+        if hasattr(self, '_bt_card'):
+            self._bt_card.pack_forget()
+        if first_connection:
+            self._show_bt_flash("✅  Téléphone connecté !")
+
+    def set_bt_disconnected(self):
+        """Réaffiche la carte BT avec le label initial."""
+        if hasattr(self, '_bt_card') and hasattr(self, '_bt_player_area'):
+            self._bt_status_label.configure(
+                text='📶  Bluetooth — en attente de connexion',
+                text_color=SUB,
+            )
+            self._bt_card.pack(
+                fill='x', padx=20, pady=(18, 0),
+                before=self._bt_player_area,
+            )
+
+    def _show_bt_flash(self, text: str):
+        """Affiche un toast vert centré sur la page Média pendant 3 secondes."""
+        if not hasattr(self, '_bt_flash'):
+            return
+        self._bt_flash_lbl.configure(text=text)
+        self._bt_flash.place(relx=0.5, rely=0.08, anchor='n')
+        self._bt_flash.lift()
+        self._bt_flash.after(3000, self._bt_flash.place_forget)
+
     def update_status(self, text: str):
         if not isinstance(text, str):
             text = str(text)
@@ -888,6 +1163,87 @@ class FaceRecognitionGUI:
         self.video_label.image = None
         self._change_driver_btn.place_forget()
         self._video_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+    # ── Clavier virtuel ───────────────────────────────────────────────────────
+    def show_keyboard(self, target: ctk.CTkEntry, on_validate=None):
+        """Affiche le clavier virtuel ciblant *target*."""
+        self._vkb.show(target, on_validate=on_validate)
+
+    def hide_keyboard(self):
+        """Masque le clavier virtuel."""
+        self._vkb.hide()
+
+    def prompt_driver_name(self) -> Optional[str]:
+        """Panneau de saisie conducteur in-app avec clavier virtuel intégré.
+        Bloque le thread Tkinter via wait_variable() (événements toujours traités).
+        """
+        result_var = tk.StringVar(value='')
+        done_var   = tk.BooleanVar(value=False)
+
+        # Fond plein écran (sans transparence — CTkFrame est opaque)
+        overlay = ctk.CTkFrame(self.root, fg_color=BG, corner_radius=0)
+        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        # Carte de saisie centrée dans la moitié haute (laisse place au clavier)
+        card = ctk.CTkFrame(overlay, fg_color=CARD_CTK, corner_radius=16)
+        card.place(relx=0.5, rely=0.30, anchor='center')
+
+        ctk.CTkLabel(
+            card,
+            text='Nouveau Conducteur',
+            text_color=CYAN,
+            font=ctk.CTkFont(family='Helvetica', size=18, weight='bold'),
+        ).pack(padx=36, pady=(22, 10))
+
+        entry = ctk.CTkEntry(
+            card, width=360, height=46, corner_radius=10,
+            fg_color=ENTRY_BG, border_color=CYAN, border_width=2,
+            text_color=TEXT,
+            placeholder_text='Nom du conducteur...',
+            font=ctk.CTkFont(family='Helvetica', size=14),
+        )
+        entry.pack(padx=36, pady=(0, 16))
+
+        btn_row = ctk.CTkFrame(card, fg_color='transparent')
+        btn_row.pack(padx=36, pady=(0, 22), fill='x')
+
+        def _confirm(*_):
+            name = entry.get().strip()
+            result_var.set(name)
+            done_var.set(True)
+            overlay.destroy()
+            self.hide_keyboard()
+
+        def _cancel(*_):
+            done_var.set(True)
+            overlay.destroy()
+            self.hide_keyboard()
+
+        entry.bind('<Return>', _confirm)
+
+        ctk.CTkButton(
+            btn_row, text='✗  Annuler',
+            width=130, height=40, corner_radius=10,
+            fg_color='#1E2D3D', hover_color='#3A2A2A', text_color=SUB,
+            font=ctk.CTkFont(family='Helvetica', size=12),
+            command=_cancel,
+        ).pack(side='left', padx=(0, 10))
+
+        ctk.CTkButton(
+            btn_row, text='✓  Valider',
+            height=40, corner_radius=10,
+            fg_color=CYAN, hover_color='#00b8cc', text_color=BG,
+            font=ctk.CTkFont(family='Helvetica', size=12, weight='bold'),
+            command=_confirm,
+        ).pack(side='left', expand=True, fill='x')
+
+        # Affiche le clavier ciblant ce champ ; ✓ OK du clavier confirme aussi
+        self.show_keyboard(entry, on_validate=_confirm)
+        self._vkb.lift()   # clavier au-dessus de l'overlay opaque
+
+        entry.focus_set()
+        self.root.wait_variable(done_var)
+        return result_var.get() or None
 
     def set_map_position(self, lat: float, lon: float, label: str = ''):
         """Centre la carte et pose un marqueur."""

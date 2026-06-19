@@ -71,7 +71,7 @@ GUI_UPDATE_INTERVAL_MS = 33 # Target ~30 FPS (milliseconds)
 GUI_WINDOW_TITLE = "Facial Recognition"
 
 # --- Serial Communication ---
-SERIAL_PORT = '/dev/cu.usbserial-0001'  # À ajuster selon l'OS (ex: 'COM3' ou '/dev/ttyACM0')
+SERIAL_PORT = '/dev/ttyUSB0'  # Port ESP32 sur Raspberry Pi
 SERIAL_BAUDRATE = 115200
 
 # --- Enrollment ---

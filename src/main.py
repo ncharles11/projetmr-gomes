@@ -2,7 +2,6 @@ import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 import tkinter as tk
-from tkinter import simpledialog
 import cv2
 import time
 import numpy as np
@@ -33,6 +32,7 @@ from src import config # Import configuration
 from src.utils import check_image_quality, draw_detection, estimate_pose
 from src.hardware_comm import ESP32Communicator
 from src.spotify_mgr import SpotifyManager
+from src.bluetooth_mgr import BluetoothManager
 from src import weather_mgr
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,9 @@ class RecognitionApp:
         self._load_utilisateurs_json()
         self.esp32_comm = ESP32Communicator()
         self.spotify = SpotifyManager()
+        self.bt = BluetoothManager()
+        self._bt_fetch_pending  = False
+        self._bt_was_connected  = False
 
         # Application state
         self.is_enrolling = False
@@ -91,9 +94,10 @@ class RecognitionApp:
         self.gui.on_enroll_user    = self._on_enroll_click
         self.gui.on_motor_manual   = self._on_motor_manual
         self.gui.on_calibrate_zero = self._on_calibrate_zero
-        self.gui.on_prev           = self.spotify.prev_track
-        self.gui.on_toggle         = self.spotify.toggle_play_pause
-        self.gui.on_next           = self.spotify.next_track
+        self.gui.on_prev             = self.bt.prev_track
+        self.gui.on_toggle           = self.bt.toggle_play_pause
+        self.gui.on_next             = self.bt.next_track
+        self.gui.on_pair_bluetooth   = self._on_pair_bluetooth
         self.gui.on_scan_wifi      = self._scan_wifi
         self.gui.on_connect_wifi   = self._connect_wifi
         self.gui.on_reset_user     = self._on_reset_user
@@ -133,12 +137,10 @@ class RecognitionApp:
 
     def _on_enroll_click(self):
         """Demande le nom du conducteur puis ouvre le panneau d'assistant d'enrôlement."""
-        person_id = simpledialog.askstring(
-            "Nouveau Conducteur", "Entrez le nom du nouveau conducteur :", parent=self.root
-        )
-        if not person_id or not person_id.strip():
+        person_id = self.gui.prompt_driver_name()
+        if not person_id:
             return
-        self._enroll_person_id = person_id.strip()
+        self._enroll_person_id = person_id
         self.current_temps_droite = 0
         self.current_temps_bas = 0
         self.is_enrolling = True
@@ -507,6 +509,85 @@ class RecognitionApp:
         except Exception as e:
             logger.error(f"Erreur lors de la lecture des messages ESP32: {e}")
 
+    # ── Bluetooth ─────────────────────────────────────────────────────────────
+
+    def _on_pair_bluetooth(self):
+        """Rend le Pi découvrable en A2DP et met à jour le statut GUI."""
+        self.gui.update_bt_status(
+            "🔵  Mode appairage actif — Connectez votre téléphone à « mehari »",
+            active=True,
+        )
+        def _on_done(status: str):
+            self.root.after(0, lambda: self.gui.update_bt_status(
+                f"✅  {status}", active=True
+            ))
+        self.bt.make_discoverable(on_done=_on_done)
+
+    def _fetch_bt_track_async(self):
+        """Récupère les métadonnées Bluetooth dans un thread (playerctl bloquant)."""
+        if self._bt_fetch_pending:
+            return
+        self._bt_fetch_pending = True
+        def _worker():
+            try:
+                info = self.bt.get_current_track_info()
+                self.root.after(0, lambda: self.gui.update_track_ui(
+                    info["title"], info["artist"], info["is_playing"]
+                ))
+            except Exception:
+                pass
+            finally:
+                self._bt_fetch_pending = False
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _bt_media_loop(self):
+        """Boucle indépendante (1 s) : surveille connexion BT et métadonnées.
+        Démarre dans run() et se replanifie tant que l'app tourne.
+        """
+        if not self.state["running"]:
+            return
+
+        if not self._bt_fetch_pending:
+            self._bt_fetch_pending = True
+
+            def _worker():
+                try:
+                    info = self.bt.get_current_track_info()
+
+                    def _update():
+                        now = info["connected"]
+                        was = self._bt_was_connected
+
+                        if now and not was:
+                            # ── Première connexion ──────────────────────────
+                            self.gui.set_bt_connected(first_connection=True)
+                        elif now:
+                            # ── Toujours connecté — carte déjà cachée ───────
+                            self.gui.set_bt_connected(first_connection=False)
+                        elif not now and was:
+                            # ── Déconnexion ─────────────────────────────────
+                            self.gui.set_bt_disconnected()
+                            self.gui.update_track_ui("En attente...", "—", False)
+                            self.gui.update_cover_art("")   # retour au placeholder
+
+                        self._bt_was_connected = now
+
+                        if now:
+                            self.gui.update_track_ui(
+                                info["title"], info["artist"], info["is_playing"]
+                            )
+                            self.gui.update_cover_art(info.get("art_url", ""))
+
+                    self.root.after(0, _update)
+                except Exception:
+                    pass
+                finally:
+                    self._bt_fetch_pending = False
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        self.root.after(1000, self._bt_media_loop)
+
     # ── Wi-Fi ─────────────────────────────────────────────────────────────────
 
     def _scan_wifi(self):
@@ -740,8 +821,7 @@ class RecognitionApp:
                 current_time = time.time()
                 if current_time - self.state["last_spotify_update"] >= 3.0:
                     self.state["last_spotify_update"] = current_time
-                    info = self.spotify.get_current_track_info()
-                    self.gui.update_track_ui(info["title"], info["artist"], info["is_playing"])
+                    self._fetch_bt_track_async()
                 if self.db and current_time - self.state["last_save_time"] > 300:
                     self.db.save_if_dirty()
                     self.state["last_save_time"] = current_time
@@ -880,6 +960,9 @@ class RecognitionApp:
 
         # Démarrer les boucles réseau et météo (non-bloquant, threads démons)
         self._update_network_and_weather()
+
+        # Boucle de surveillance Bluetooth Média (indépendante, 1 s)
+        self.root.after(1000, self._bt_media_loop)
 
         # Charger le GIF de marqueur et lancer la boucle d'animation
         marker_gif = os.path.join('assets', 'position_marker.gif')

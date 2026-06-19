@@ -9,17 +9,18 @@ logger = logging.getLogger(__name__)
 class ESP32Communicator:
     def __init__(self):
         self.ser = None
+        self.simulation_mode = False
         try:
             self.ser = serial.Serial(config.SERIAL_PORT, config.SERIAL_BAUDRATE, timeout=0.01)
-            # Forcer le réveil de l'ESP32 sous macOS (toggle DTR/RTS)
             self.ser.dtr = False
             self.ser.rts = False
             time.sleep(0.1)
             self.ser.dtr = True
             self.ser.rts = True
-            logger.info(f"Connected to ESP32 on {config.SERIAL_PORT} at {config.SERIAL_BAUDRATE} baud (timeout=0.01).")
+            logger.info(f"Connected to ESP32 on {config.SERIAL_PORT} at {config.SERIAL_BAUDRATE} baud.")
         except Exception as e:
-            logger.error(f"Failed to connect to ESP32 on {config.SERIAL_PORT}: {e}")
+            self.simulation_mode = True
+            logger.warning(f"ESP32 non disponible sur {config.SERIAL_PORT} : {e} — mode Simulation activé.")
 
     def send_auth_data(self, person_id, temps_droite=0, temps_bas=0):
         if self.ser is None or not self.ser.is_open:
