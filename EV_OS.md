@@ -65,7 +65,8 @@ NAV_ACT  = '#1A3A4A'       # Navbouton actif
 BLACK    = '#000000'       # Pour ombres/contrastes
 ```
 
-Tous les composants (CTkFrame, CTkButton, CTkLabel, CTkProgressBar, CTkEntry) utilisent cette palette. **Résultat** : interface cohérente, moderne, lisible sur écran tactile 10,1" même en plein soleil.
+Tous les composants (CTkFrame, CTkButton, CTkLabel, CTkProgressBar, CTkEntry) utilisent cette palette. 
+**Résultat** : interface cohérente, moderne, lisible sur écran tactile 10,1" même en plein soleil.
 
 #### Layout Non-Bloquant
 
